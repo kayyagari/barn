@@ -1,0 +1,13 @@
+{
+  "id": 1,
+  "account_id": 1,
+  "approved": false,
+  "country_code": "IN",
+  "created_at": 1603171057002,
+  "display_name": "b1",
+  "reg_id": "id1",
+  "location": [90.0, 1],
+  "reg_from_ip": "127.0.0.1",
+  "reg_from_location": [2.0, 2.0],
+  "category_id": 1
+}

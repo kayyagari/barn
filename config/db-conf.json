@@ -1,0 +1,17 @@
+{
+  "resources": [
+      {
+        "name": "Business",
+        "indices": [
+          {
+            "at_path": "reg_id",
+            "unique": true
+          },
+          {
+            "at_path": "location",
+            "unique": false
+          }
+        ]
+      }
+  ]
+}
