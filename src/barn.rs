@@ -1,12 +1,18 @@
-use lmdb::{Environment, Database, DatabaseFlags, Transaction};
+use lmdb::{Environment, Database, DatabaseFlags, Transaction, RwTransaction, WriteFlags};
 use std::collections::HashMap;
 use std::fs;
-use log::{info, warn};
+use log::{info, warn, trace};
 use std::path::Path;
 use serde_json::Value;
 use thiserror::Error;
 use serde::{Deserialize, Serialize};
-use crate::barn::BarnError::{EnvOpenError, DbConfigError, TxError};
+use crate::barn::BarnError::{EnvOpenError, DbConfigError, TxCommitError};
+use rmps::{Deserializer, Serializer};
+use std::convert::TryInto;
+use std::io::BufReader;
+use std::borrow::BorrowMut;
+
+const DB_PRIMARY_KEY_KEY : [u8; 8] = 0_i64.to_le_bytes();
 
 pub struct Barn {
     env: Environment,
@@ -15,13 +21,18 @@ pub struct Barn {
 
 struct Barrel {
     db: Database,
-    indices: HashMap<String, Index>
+    id_attr_name: String,
+    id_attr_type: String,
+    indices: HashMap<String, Index>,
+    flags: WriteFlags
 }
 
 struct Index {
     db: Database,
     unique: bool,
-    val_type: String
+    at_path: String,
+    val_type: String,
+    flags: WriteFlags
     //key_maker: KeyMaker
 }
 
@@ -33,25 +44,42 @@ pub struct DbConf {
 #[derive(Debug, Serialize, Deserialize)]
 struct ResourceConf {
     name: String,
+    id_attr_name: String,
+    id_attr_type: String,
     indices: Vec<IndexConf>
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct IndexConf {
-    at_path: String,
+    attr_path: String,
     unique: Option<bool>
 }
 
 #[derive(Debug, Error)]
 pub enum BarnError {
+    #[error("invalid resource, config validation failed")]
+    InvalidResourceError,
+
+    #[error("could not serialize the given resource")]
+    SerializationError,
+
     #[error("could not open the environment")]
     EnvOpenError,
 
     #[error("invalid DB configuration")]
     DbConfigError,
 
-    #[error("transaction error")]
-    TxError
+    #[error("failed to commit transaction")]
+    TxCommitError,
+
+    #[error("failed to begin a new transaction")]
+    TxBeginError,
+
+    #[error("failed to write data")]
+    TxWriteError,
+
+    #[error("invalid resource data error")]
+    InvalidResourceDataError,
 }
 
 impl Barn {
@@ -79,7 +107,7 @@ impl Barn {
             match res_def {
                 Some(v) => {
                     for i in &r.indices {
-                        let at_path = i.at_path.replace(".", "/");
+                        let at_path = i.attr_path.replace(".", "/");
                         let at_pointer = format!("/properties/{}", &at_path);
                         let at_def = v.pointer(at_pointer.as_str()).unwrap().as_object().unwrap();
                         let at_type_val : &str;
@@ -98,12 +126,21 @@ impl Barn {
                         }
 
                         unsafe {
-                            let index_name = format!("{}_{}", &r.name, &i.at_path);
-                            let db = tx.create_db(Some(index_name.as_str()), DatabaseFlags::INTEGER_KEY).unwrap();
+                            let index_name = format!("{}_{}", &r.name, &i.attr_path);
+                            let mut flags = DatabaseFlags::empty();
+                            if !unique {
+                                flags = flags | DatabaseFlags::INTEGER_DUP | DatabaseFlags::DUP_SORT | DatabaseFlags::DUP_FIXED;
+                            }
+
+                            let db = tx.create_db(Some(index_name.as_str()), flags).unwrap();
+                            // prefix with a slash to make it a valid pointer for the object
+                            let at_path = format!("/{}", &at_path);
                             let idx = Index{
                                 db,
                                 unique,
-                                val_type: String::from(at_type_val)
+                                at_path,
+                                val_type: String::from(at_type_val),
+                                flags: WriteFlags::empty()
                             };
 
                             indices.insert(index_name, idx);
@@ -115,7 +152,10 @@ impl Barn {
                         let db = tx.create_db(Some(r.name.as_str()), DatabaseFlags::INTEGER_KEY).unwrap();
                         let barrel = Barrel{
                             db,
-                            indices
+                            indices,
+                            id_attr_name: r.id_attr_name.clone(),
+                            id_attr_type: r.id_attr_type.clone(),
+                            flags: WriteFlags::empty()
                         };
                         barrels.insert(r.name.clone(), barrel);
                     }
@@ -135,17 +175,133 @@ impl Barn {
                 })
             },
             Err(e) => {
-                Err(TxError)
+                Err(TxCommitError)
+            }
+        }
+    }
+
+    pub fn insert(&self, res_name: String, r: &mut Value) -> Result<(), BarnError> {
+        let barrel = self.barrels.get(res_name.as_str());
+        if let None = barrel {
+            return Err(BarnError::InvalidResourceDataError);
+        }
+
+        let tx_result = self.env.begin_rw_txn();
+
+        match tx_result {
+            Ok(mut tx) => {
+                let barrel_result = barrel.unwrap().insert(&mut tx, r);
+                match barrel_result {
+                    Ok(_) => {
+                        match tx.commit() {
+                            Ok(_) => {
+                                Ok(())
+                            },
+                            Err(e) => {
+                                warn!("failed to insert resource {}", e);
+                                Err(BarnError::TxCommitError)
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        warn!("aborting transaction due to {}", e);
+                        tx.abort();
+                        Err(e)
+                    }
+                }
+            },
+            Err(e) => {
+                Err(BarnError::TxBeginError)
             }
         }
     }
 }
-impl Index {
-    fn new(name : String) {
 
+impl Index {
+    fn insert(&self, tx: &mut RwTransaction, k: &Value, v: u64) -> Result<(), BarnError> {
+        match self.val_type.as_str() {
+            "integer" => {
+                if let Some(i) = k.as_i64() {
+                    let key_data = i.to_le_bytes();
+                    let put_result = tx.put(self.db, &key_data, &v.to_le_bytes(), self.flags);
+                    if let Err(e) = put_result {
+                        return Err(BarnError::TxWriteError);
+                    }
+                }
+            },
+            _ => {
+
+            }
+        }
+
+        Ok(())
     }
 }
 
+impl Barrel {
+    fn insert(&self, tx: &mut RwTransaction, data : &mut Value) -> Result<(), BarnError> {
+        let d_obj = data.as_object_mut();
+        if let None = d_obj {
+            return Err(BarnError::InvalidResourceDataError);
+        }
+
+        let d_obj = d_obj.unwrap();
+        let pk_result = tx.get(self.db, &DB_PRIMARY_KEY_KEY);
+        let mut pk: u64 = 1;
+        if let Ok(r) = pk_result {
+            pk = u64::from_le_bytes(r.try_into().unwrap());
+            pk += 1;
+        }
+
+        let pk_val;
+        match self.id_attr_type.as_str() {
+            "string" => {
+                pk_val = Value::from(format!("{}", pk));
+            },
+            _ => {
+                pk_val = Value::from(pk);
+            }
+        }
+        let mut pk_attr = d_obj.get(&self.id_attr_name);
+        if let Some(id_val) = pk_attr {
+            trace!("dropping the value {} given for ID attribute {}", &id_val, &self.id_attr_name);
+            pk_attr.replace(&pk_val);
+        }
+        else {
+            d_obj.insert(self.id_attr_name.clone(), pk_val);
+        }
+
+        let mut buf: Vec<u8> = Vec::new();
+        let ser_result = data.serialize(&mut Serializer::new(&mut buf));
+        match ser_result {
+            Ok(_) => {
+                let put_result = tx.put(self.db, &pk.to_le_bytes(), AsRef::<Vec<u8>>::as_ref(&buf), self.flags);
+                if let Err(_) = put_result {
+                    return Err(BarnError::TxWriteError);
+                }
+
+                for (at_name, i) in &self.indices {
+                    let at = data.pointer(at_name);
+                    if let Some(at_val) = at {
+                        i.insert(tx, at_val, pk)?;
+                    }
+                }
+
+                // store the updated PK value
+                let put_result = tx.put(self.db, &DB_PRIMARY_KEY_KEY, &pk.to_le_bytes(), self.flags);
+                if let Err(e) = put_result {
+                    return Err(BarnError::TxWriteError);
+                }
+            },
+            Err(e) => {
+                warn!("{:#?}", e);
+                return Err(BarnError::SerializationError);
+            }
+        }
+
+        Ok(())
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,7 +344,7 @@ mod tests {
             }
 
             for i in &dr.indices {
-                let index_name = format!("{}_{}", &dr.name, i.at_path);
+                let index_name = format!("{}_{}", &dr.name, i.attr_path);
                 let index = barrel.unwrap().indices.get(&index_name);
                 if let None = index {
                     println!("database for index {} not found", &index_name);

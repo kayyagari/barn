@@ -2,9 +2,10 @@ use std::collections::HashMap;
 
 use jsonschema::JSONSchema;
 use rmps::{Deserializer, Serializer};
-use serde::{de, Deserialize, ser, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value};
 use thiserror::Error;
+use crate::barn::BarnError;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Business {
@@ -24,21 +25,12 @@ struct Business {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Point {
-    pub lat : f64,
-    pub long : f64
+    pub lat : f32,
+    pub long : f32
 }
 pub struct ResourceType<'a> {
     name: String,
     schema: JSONSchema<'a>
-}
-
-#[derive(Debug, Error)]
-pub enum ResourceError {
-    #[error("invalid resource, config validation failed")]
-    InvalidResourceError,
-
-    #[error("could not serialize the given resource")]
-    SerializationError
 }
 
 impl <'a> ResourceType<'a> {
@@ -57,7 +49,7 @@ impl <'a> ResourceType<'a> {
 }
 
 impl Business {
-    pub fn new<R>(r : R, rt : &ResourceType) -> Result<Business, ResourceError>
+    pub fn new<R>(r : R, rt : &ResourceType) -> Result<Business, BarnError>
     where
     R: std::io::Read {
         let v : Value = serde_json::from_reader(r).unwrap();
@@ -69,7 +61,7 @@ impl Business {
             },
             Err(ei) => {
                 ei.into_iter().all(|e| {println!("{:#?}", e); true});
-                Result::Err(ResourceError::InvalidResourceError)
+                Result::Err(BarnError::InvalidBarnError)
             }
         }*/
 
@@ -77,17 +69,17 @@ impl Business {
             Result::Ok(serde_json::from_value(v).unwrap())
         }
         else {
-            Result::Err(ResourceError::InvalidResourceError)
+            Result::Err(BarnError::InvalidResourceError)
         }
     }
 
-    pub fn to_msg_pack(&self) -> Result<Vec<u8>, ResourceError> {
+    pub fn to_msg_pack(&self) -> Result<Vec<u8>, BarnError> {
         let mut buf = Vec::new();
         let result = self.serialize(&mut Serializer::new(&mut buf));
         match result {
             Err(e) => {
                 println!("{:#?}", e);
-                Result::Err(ResourceError::SerializationError)
+                Result::Err(BarnError::SerializationError)
             },
             Ok(_) => {
                 Result::Ok(buf)
