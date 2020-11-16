@@ -243,7 +243,7 @@ impl Barn {
         match tx_result {
             Ok(tx) => {
                 let val_result = barrel.unwrap().get(id, &tx);
-                tx.commit();
+                let _ = tx.commit();
                 val_result
             },
             Err(e) => {
