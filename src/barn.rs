@@ -7,12 +7,11 @@ use serde_json::Value;
 use thiserror::Error;
 use serde::{Deserialize, Serialize};
 use crate::barn::BarnError::{EnvOpenError, DbConfigError, TxCommitError};
-use rmps::{Deserializer, Serializer};
+use rmps::{Serializer};
 use std::convert::TryInto;
-use std::io::BufReader;
-use std::borrow::BorrowMut;
 
 const DB_PRIMARY_KEY_KEY : [u8; 8] = 0_i64.to_le_bytes();
+const PK_WRITE_FLAGS: WriteFlags = WriteFlags::empty();
 
 pub struct Barn {
     env: Environment,
@@ -322,7 +321,7 @@ impl Barrel {
             Ok(_) => {
                 // first update indices, this will catch any unique constraint violations
                 for (at_name, i) in &self.indices {
-                    let at = data.pointer(at_name);
+                    let at = data.pointer(&i.at_path);
                     if let Some(at_val) = at {
                         i.insert(tx, at_val, pk)?;
                     }
@@ -335,7 +334,7 @@ impl Barrel {
                 }
 
                 // store the updated PK value
-                let put_result = tx.put(self.db, &DB_PRIMARY_KEY_KEY, &pk.to_le_bytes(), self.flags);
+                let put_result = tx.put(self.db, &DB_PRIMARY_KEY_KEY, &pk.to_le_bytes(), PK_WRITE_FLAGS);
                 if let Err(e) = put_result {
                     return Err(BarnError::TxWriteError);
                 }
