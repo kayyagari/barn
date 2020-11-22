@@ -24,8 +24,10 @@ async fn main() -> std::io::Result<()> {
     let db_conf_file = fs::File::open("config/db-conf.json").unwrap();
     let db_conf = serde_json::from_reader(db_conf_file).unwrap();
 
-    let barn = barn::Barn::open(&env_dir, &db_conf, &schema::SCHEMA_VAL).unwrap();
-    let validator = JSONSchema::compile(&schema::SCHEMA_VAL, None).unwrap();
+    let schema_file = fs::File::open("config/schema.json").unwrap();
+    let barn = barn::Barn::open(&env_dir, &db_conf, schema_file).unwrap();
+    let s_ref: &'static serde_json::Value = Box::leak(barn.schema.clone());
+    let validator = JSONSchema::compile(s_ref, None).unwrap();
     let ad: AppData = barn::AppData {
         barn: Arc::new(barn),
         validator: Arc::new(validator)

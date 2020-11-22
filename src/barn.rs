@@ -9,13 +9,15 @@ use serde::{Deserialize, Serialize};
 use crate::barn::BarnError::{EnvOpenError, DbConfigError, TxCommitError};
 use rmps::{Serializer};
 use std::convert::TryInto;
+use std::io::Read;
 
 const DB_PRIMARY_KEY_KEY : [u8; 8] = 0_i64.to_le_bytes();
 const PK_WRITE_FLAGS: WriteFlags = WriteFlags::empty();
 
 pub struct Barn {
     env: Environment,
-    barrels: HashMap<String, Barrel>
+    barrels: HashMap<String, Barrel>,
+    pub schema: Box<Value>
 }
 
 struct Barrel {
@@ -94,7 +96,8 @@ pub enum BarnError {
 }
 
 impl Barn {
-    pub fn open(env_dir: &String, db_conf: &DbConf, schema: &Value) -> Result<Barn, BarnError> {
+    pub fn open<R>(env_dir: &String, db_conf: &DbConf, schema_rdr: R) -> Result<Barn, BarnError>
+    where R: Read {
         let r = fs::create_dir_all(env_dir.clone());
         match r {
             Err(e) => {
@@ -106,6 +109,7 @@ impl Barn {
             }
         }
 
+        let schema: Value = serde_json::from_reader(schema_rdr).unwrap();
         let env = Environment::new().set_max_dbs(20000).open(Path::new(&env_dir)).unwrap();
         let mut barrels: HashMap<String, Barrel> = HashMap::new();
 
@@ -187,7 +191,8 @@ impl Barn {
             Ok(_) => {
                 Ok(Barn {
                     env,
-                    barrels
+                    barrels,
+                    schema: Box::new(schema)
                 })
             },
             Err(e) => {
