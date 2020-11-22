@@ -96,7 +96,7 @@ pub enum BarnError {
 }
 
 impl Barn {
-    pub fn open<R>(env_dir: &String, db_conf: &DbConf, schema_rdr: R) -> Result<Barn, BarnError>
+    pub fn open<R>(env_dir: &str, db_conf: &DbConf, schema_rdr: R) -> Result<Barn, BarnError>
     where R: Read {
         let r = fs::create_dir_all(env_dir.clone());
         match r {

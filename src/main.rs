@@ -5,27 +5,51 @@ use std::sync::Arc;
 use barn::AppData;
 use jsonschema::JSONSchema;
 use log4rs::append::console::ConsoleAppender;
-use log4rs::Config;
-use log4rs::config::{Appender, Root};
+use log4rs::config::{Appender, Root, Config};
 use log::{info, LevelFilter};
+use clap::{Arg};
 
 mod schema;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     configure_log4rs();
-    let mut env_dir = String::from("/tmp/barn");
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() == 2 {
-        env_dir = args[1].clone();
-    }
+    let matches = clap::App::new("barn")
+        .arg(Arg::with_name("d")
+            .short("d")
+            .long("dir")
+            .help("path to the data directory")
+            .takes_value(true)
+            .default_value("/tmp/barn")
+        )
+        .arg(Arg::with_name("s")
+            .short("s")
+            .long("schema")
+            .help("path to the JSON schema file")
+            .takes_value(true)
+            .default_value("config/schema.json"))
+        .arg(Arg::with_name("c")
+            .short("c")
+            .long("conf")
+            .help("path to the DB config file")
+            .takes_value(true)
+            .default_value("config/db-conf.json"))
+        .get_matches();
 
-    info!("using data dir {}", &env_dir);
-    let db_conf_file = fs::File::open("config/db-conf.json").unwrap();
+    let env_dir = matches.value_of("d").unwrap();
+    info!("using data dir {}", env_dir);
+
+    let schema_file = matches.value_of("s").unwrap();
+    info!("using schema file {}", schema_file);
+
+    let db_conf_file = matches.value_of("c").unwrap();
+    info!("using db conf file {}", db_conf_file);
+
+    let db_conf_file = fs::File::open(db_conf_file).unwrap();
     let db_conf = serde_json::from_reader(db_conf_file).unwrap();
 
-    let schema_file = fs::File::open("config/schema.json").unwrap();
-    let barn = barn::Barn::open(&env_dir, &db_conf, schema_file).unwrap();
+    let schema_file = fs::File::open(schema_file).unwrap();
+    let barn = barn::Barn::open(env_dir, &db_conf, schema_file).unwrap();
     let s_ref: &'static serde_json::Value = Box::leak(barn.schema.clone());
     let validator = JSONSchema::compile(s_ref, None).unwrap();
     let ad: AppData = barn::AppData {
