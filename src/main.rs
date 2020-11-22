@@ -1,23 +1,26 @@
 use std::fs;
 
-use actix_web::{get, web, App, HttpServer};
+use actix_web::{web, App, HttpServer};
 use std::sync::Arc;
 use barn::AppData;
 use jsonschema::JSONSchema;
 use log4rs::append::console::ConsoleAppender;
 use log4rs::Config;
 use log4rs::config::{Appender, Root};
-use log::LevelFilter;
+use log::{info, LevelFilter};
 
 mod schema;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     configure_log4rs();
-    let env_dir = String::from("/tmp/barn");
-    // cleanup
-    //fs::remove_dir_all(env_dir.clone());
+    let mut env_dir = String::from("/tmp/barn");
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() == 2 {
+        env_dir = args[1].clone();
+    }
 
+    info!("using data dir {}", &env_dir);
     let db_conf_file = fs::File::open("config/db-conf.json").unwrap();
     let db_conf = serde_json::from_reader(db_conf_file).unwrap();
 
@@ -47,7 +50,7 @@ fn configure_log4rs() {
 
     let config = Config::builder()
         .appender(Appender::builder().build("stdout", Box::new(stdout)))
-        .build(Root::builder().appender("stdout").build(LevelFilter::Trace))
+        .build(Root::builder().appender("stdout").build(LevelFilter::Info))
         .unwrap();
 
     let _handle = log4rs::init_config(config).unwrap();
