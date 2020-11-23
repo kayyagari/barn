@@ -117,7 +117,11 @@ impl Barn {
         for r in &db_conf.resources {
             let mut p = String::from("/definitions/");
             p.push_str(&r.name);
-            let res_def = schema.pointer(p.as_str());
+            let mut res_def = schema.pointer(p.as_str());
+            if let None = res_def {
+                res_def = schema.pointer("/properties");
+            }
+
             let mut indices: HashMap<String, Index> = HashMap::new();
             match res_def {
                 Some(v) => {

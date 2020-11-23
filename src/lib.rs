@@ -14,7 +14,7 @@ use serde_json::Value;
 #[derive(Clone)]
 pub struct AppData<'a> {
     pub barn: Arc<barn::Barn>,
-    pub validator: Arc<jsonschema::JSONSchema<'a>>
+    pub validator: Arc<jsonschema_valid::Config<'a>>
 }
 
 #[get("/")]
@@ -26,11 +26,14 @@ pub async fn echo(ad: web::Data<AppData<'_>>) -> impl Responder {
 #[post("/{name}")]
 pub async fn insert(r: Json<Value>, Path(res_name): Path<String>, req: HttpRequest, ad: Data<AppData<'_>>) -> impl Responder {
     let mut r = r.into_inner();
-    let valid = ad.validator.is_valid(&r);
-    if !valid {
+    let valid = ad.validator.validate(&r);
+    if let Err(e) = valid {
+        for i in e {
+            warn!("validation error: {} {}", &i.instance_path.join("/"), &i.msg);
+        }
         return HttpResponse::BadRequest();
     }
-
+    drop(valid);
     let insert_result = ad.barn.insert(res_name, &mut r);
     if let Err(e) = insert_result {
         warn!("{}", e);

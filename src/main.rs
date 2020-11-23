@@ -3,11 +3,12 @@ use std::fs;
 use actix_web::{web, App, HttpServer};
 use std::sync::Arc;
 use barn::AppData;
-use jsonschema::JSONSchema;
 use log4rs::append::console::ConsoleAppender;
 use log4rs::config::{Appender, Root, Config};
 use log::{info, LevelFilter};
 use clap::{Arg};
+use jsonschema_valid::schemas::Draft::*;
+use serde_json::Value;
 
 mod schema;
 
@@ -51,7 +52,8 @@ async fn main() -> std::io::Result<()> {
     let schema_file = fs::File::open(schema_file).unwrap();
     let barn = barn::Barn::open(env_dir, &db_conf, schema_file).unwrap();
     let s_ref: &'static serde_json::Value = Box::leak(barn.schema.clone());
-    let validator = JSONSchema::compile(s_ref, None).unwrap();
+    let draft = draft_from_schema(s_ref);
+    let validator = jsonschema_valid::Config::from_schema(s_ref, draft).unwrap();
     let ad: AppData = barn::AppData {
         barn: Arc::new(barn),
         validator: Arc::new(validator)
@@ -80,4 +82,22 @@ fn configure_log4rs() {
         .unwrap();
 
     let _handle = log4rs::init_config(config).unwrap();
+}
+
+// the same method from jsonschema_valid has missing # chars at the end resulting in None for all schemas
+fn draft_from_url(url: &str) -> Option<jsonschema_valid::schemas::Draft> {
+    match url {
+        "http://json-schema.org/draft-07/schema#" => Some(Draft7),
+        "http://json-schema.org/draft-06/schema#" => Some(Draft6),
+        "http://json-schema.org/draft-04/schema#" => Some(Draft4),
+        _ => None,
+    }
+}
+
+fn draft_from_schema(schema: &Value) -> Option<jsonschema_valid::schemas::Draft> {
+    schema
+        .as_object()
+        .and_then(|x| x.get("$schema"))
+        .and_then(Value::as_str)
+        .and_then(|x| draft_from_url(x))
 }
