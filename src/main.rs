@@ -69,7 +69,7 @@ async fn main() -> std::io::Result<()> {
             .service(barn::get)
             .service(barn::search)
     })
-    .bind("localhost:9070")?
+    .bind("0.0.0.0:9070")?
     .run()
     .await
 }
