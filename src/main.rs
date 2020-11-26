@@ -67,6 +67,7 @@ async fn main() -> std::io::Result<()> {
             .service(barn::echo)
             .service(barn::insert)
             .service(barn::get)
+            .service(barn::search)
     })
     .bind("localhost:9070")?
     .run()

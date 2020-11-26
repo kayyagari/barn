@@ -1,4 +1,4 @@
-use actix_web::{get, post, web, HttpRequest, Responder, HttpResponse};
+use actix_web::{get, post, web, HttpRequest, Responder, HttpResponse, Either};
 use actix_web::web::*;
 use log::{warn};
 extern crate rmp_serde as rmps;
@@ -9,7 +9,12 @@ pub mod schema;
 pub use barn::*;
 pub use crate::schema::*;
 use std::sync::Arc;
+use std::sync::mpsc::{Sender, Receiver, channel};
 use serde_json::Value;
+use futures::Stream;
+use futures::task::{Context, Poll};
+use std::pin::Pin;
+use serde::{Deserialize};
 
 #[derive(Clone)]
 pub struct AppData<'a> {
@@ -53,3 +58,23 @@ pub async fn get(Path((res_name, res_id)): Path<(String, u64)>, req: HttpRequest
 
     HttpResponse::Ok().json(get_result.unwrap())
 }
+
+#[derive(Deserialize)]
+struct SearchRequest {
+    q: String
+}
+
+#[get("/{name}")]
+pub async fn search(Path(res_name): Path<String>, query: Query<SearchRequest>, req: HttpRequest, ad: Data<AppData<'_>>) -> HttpResponse {
+    let (sn, rc) = channel();
+    let get_result = ad.barn.search(res_name, query.0.q, sn);
+    if let Err(e) = get_result {
+        warn!("{}", e);
+        return HttpResponse::NotFound().finish();
+    }
+
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .streaming(futures::stream::iter(rc))
+}
+

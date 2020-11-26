@@ -1,4 +1,4 @@
-use lmdb::{Environment, Database, DatabaseFlags, Transaction, RwTransaction, WriteFlags, RoTransaction};
+use lmdb::{Environment, Database, DatabaseFlags, Transaction, RwTransaction, WriteFlags, RoTransaction, Cursor};
 use std::collections::HashMap;
 use std::fs;
 use log::{info, warn, trace, debug};
@@ -10,8 +10,12 @@ use crate::barn::BarnError::{EnvOpenError, DbConfigError, TxCommitError};
 use rmps::{Serializer};
 use std::convert::TryInto;
 use std::io::Read;
+use jsonpath_lib::Selector;
+use std::sync::mpsc::Sender;
+use actix_web::web::Bytes;
 
 const DB_PRIMARY_KEY_KEY : [u8; 8] = 0_i64.to_le_bytes();
+const DB_READ_START_KEY : [u8; 8] = 1_i64.to_le_bytes();
 const PK_WRITE_FLAGS: WriteFlags = WriteFlags::empty();
 
 pub struct Barn {
@@ -39,6 +43,7 @@ struct Index {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DbConf {
+    db_size: usize,
     resources: Vec<ResourceConf>
 }
 
@@ -82,6 +87,9 @@ pub enum BarnError {
     #[error("failed to write data")]
     TxWriteError,
 
+    #[error("failed to read data")]
+    TxReadError,
+
     #[error("invalid resource data error")]
     InvalidResourceDataError,
 
@@ -92,7 +100,10 @@ pub enum BarnError {
     UnknownResourceName,
 
     #[error("unsupported index value type")]
-    UnsupportedIndexValueType
+    UnsupportedIndexValueType,
+
+    #[error("bad search filter")]
+    BadSearchFilter
 }
 
 impl Barn {
@@ -110,7 +121,8 @@ impl Barn {
         }
 
         let schema: Value = serde_json::from_reader(schema_rdr).unwrap();
-        let env = Environment::new().set_max_dbs(20000).open(Path::new(&env_dir)).unwrap();
+        let db_size_in_bytes: usize = db_conf.db_size * 1024 * 1024;
+        let env = Environment::new().set_max_dbs(20000).set_map_size(db_size_in_bytes).open(Path::new(&env_dir)).unwrap();
         let mut barrels: HashMap<String, Barrel> = HashMap::new();
 
         let tx = env.begin_rw_txn().unwrap();
@@ -258,6 +270,70 @@ impl Barn {
                 Err(BarnError::TxBeginError)
             }
         }
+    }
+
+    pub fn search(&self, res_name: String, expr: String, sn: Sender<Result<Bytes, std::io::Error>>) -> Result<(), BarnError> {
+        let barrel = self.barrels.get(res_name.as_str());
+        if let None = barrel {
+            return Err(BarnError::UnknownResourceName);
+        }
+
+        let tx_result = self.env.begin_ro_txn();
+        if let Err(e) = tx_result {
+            return Err(BarnError::TxBeginError);
+        }
+
+        let mut compiled_path = jsonpath_lib::compile(expr.as_str());
+
+        let barrel = barrel.unwrap();
+        let tx = tx_result.unwrap();
+        let cursor = tx.open_ro_cursor(barrel.db);
+        if let Err(e) = cursor {
+            return Err(BarnError::TxReadError);
+        }
+
+        let send_result = sn.send(Ok(Bytes::from_static(b"[")));
+
+        let mut send_comma = false;
+        // the first row will always be key 0 which stores the PK value, and will be skipped
+        for row in cursor.unwrap().iter_from(DB_READ_START_KEY) {
+            if let Err(e) = row {
+                break;
+            }
+
+            let (key, data) = row.unwrap();
+            let json_val: Value = rmps::from_read_ref(data).unwrap();
+            let result = compiled_path(&json_val);
+            if result.is_ok() {
+                if result.unwrap().len() == 0 {
+                    continue;
+                }
+                let str_result = serde_json::to_vec(&json_val);
+                match str_result {
+                    Ok(vec) => {
+                        if send_comma {
+                            let send_result = sn.send(Ok(Bytes::from_static(b",")));
+                        }
+                        let send_result = sn.send(Ok(Bytes::from(vec)));
+                        if let Err(e) = send_result {
+                            warn!("error received while sending search results {:?}", e);
+                            break;
+                        }
+                        send_comma = true;
+                    }
+                    Err(e) => {
+                        warn!("failed to convert the result to string, stopping further processing {:?}", e);
+                        break;
+                    }
+                }
+            }
+        }
+
+        let send_result = sn.send(Ok(Bytes::from_static(b"]")));
+        drop(sn);
+        let _ = tx.commit();
+
+        Ok(())
     }
 }
 
