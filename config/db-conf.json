@@ -1,5 +1,6 @@
 {
   "db_size": 10,
+  "no_sync": true,
   "resources": [
       {
         "name": "Business",

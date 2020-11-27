@@ -1,4 +1,4 @@
-use lmdb::{Environment, Database, DatabaseFlags, Transaction, RwTransaction, WriteFlags, RoTransaction, Cursor};
+use lmdb::{Environment, Database, DatabaseFlags, Transaction, RwTransaction, WriteFlags, RoTransaction, Cursor, EnvironmentFlags};
 use std::collections::HashMap;
 use std::fs;
 use log::{info, warn, trace, debug};
@@ -44,6 +44,7 @@ struct Index {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DbConf {
     db_size: usize,
+    no_sync: bool,
     resources: Vec<ResourceConf>
 }
 
@@ -122,7 +123,11 @@ impl Barn {
 
         let schema: Value = serde_json::from_reader(schema_rdr).unwrap();
         let db_size_in_bytes: usize = db_conf.db_size * 1024 * 1024;
-        let env = Environment::new().set_max_dbs(20000).set_map_size(db_size_in_bytes).open(Path::new(&env_dir)).unwrap();
+        let mut env_flags = EnvironmentFlags::NO_READAHEAD;
+        if db_conf.no_sync {
+            env_flags |= EnvironmentFlags::NO_SYNC;
+        }
+        let env = Environment::new().set_flags(env_flags).set_max_dbs(20000).set_map_size(db_size_in_bytes).open(Path::new(&env_dir)).unwrap();
         let mut barrels: HashMap<String, Barrel> = HashMap::new();
 
         let tx = env.begin_rw_txn().unwrap();
