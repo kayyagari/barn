@@ -13,8 +13,8 @@ use serde_json::Value;
 mod schema;
 
 //#[cfg(target_os = "linux")]
-#[global_allocator]
-static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+// #[global_allocator]
+// static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
