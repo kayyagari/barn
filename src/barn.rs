@@ -484,11 +484,10 @@ mod tests {
     fn test_open_barn() {
         let env_dir = String::from("/tmp/barn");
         let schema_file = fs::File::open("config/schema.json").unwrap();
-        let schema: Value = serde_json::from_reader(schema_file).unwrap();
         let db_conf_file = fs::File::open("config/db-conf.json").unwrap();
         let db_conf = serde_json::from_reader(db_conf_file).unwrap();
 
-        let result = Barn::open(&env_dir, &db_conf, &schema);
+        let result = Barn::open(&env_dir, &db_conf, schema_file);
         match result {
             Ok(ref b) => {
                 let dir = fs::read_dir(Path::new(&env_dir));

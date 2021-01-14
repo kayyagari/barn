@@ -5,6 +5,7 @@ extern crate rmp_serde as rmps;
 pub mod barn;
 mod yard;
 pub mod schema;
+pub mod sql;
 
 pub use barn::*;
 pub use crate::schema::*;
