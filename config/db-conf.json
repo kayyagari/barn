@@ -1,22 +1,26 @@
 {
   "db_size": 10,
   "no_sync": true,
-  "resources": [
-      {
-        "name": "Business",
-        "id_attr_name": "id",
-        "id_attr_type": "string",
-        "indices": [
-          {
-            "attr_path": "reg_id",
-            "unique": true
-          },
-          {
-            "attr_path": "display_name",
-            "unique": false,
-            "normalizer": ""
-          }
-        ]
-      }
-  ]
+  "allow_conf_resources_only": false,
+  "resource_defaults": {
+    "id_attr_name": "id",
+    "id_attr_type": "string"
+  },
+  "resources": {
+    "Business": {
+      "id_attr_name": "id",
+      "id_attr_type": "string",
+      "indices": [
+        {
+          "attr_path": "reg_id",
+          "unique": true
+        },
+        {
+          "attr_path": "display_name",
+          "normalizer": "",
+          "unique": false
+        }
+      ]
+    }
+  }
 }
