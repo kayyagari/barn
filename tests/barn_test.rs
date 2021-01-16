@@ -1,7 +1,7 @@
 use std::fs;
 use serde_json::{Value, from_str};
 use barn;
-use barn::BarnError;
+use barn::errors::BarnError;
 
 #[test]
 fn test_insert() {

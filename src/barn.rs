@@ -1,18 +1,21 @@
-use lmdb::{Environment, Database, DatabaseFlags, Transaction, RwTransaction, WriteFlags, RoTransaction, Cursor, EnvironmentFlags};
 use std::collections::HashMap;
-use std::fs;
-use log::{info, warn, trace, debug};
-use std::path::Path;
-use serde_json::Value;
-use thiserror::Error;
-use serde::{Deserialize, Serialize};
-use crate::barn::BarnError::{EnvOpenError, DbConfigError, TxCommitError};
-use rmps::{Serializer};
 use std::convert::TryInto;
+use std::fs;
 use std::io::Read;
-use jsonpath_lib::Selector;
+use std::path::Path;
 use std::sync::mpsc::Sender;
+
 use actix_web::web::Bytes;
+use chrono::{DateTime, NaiveDate, NaiveDateTime};
+use jsonpath_lib::Selector;
+use lmdb::{Cursor, Database, DatabaseFlags, Environment, EnvironmentFlags, RoTransaction, RwTransaction, Transaction, WriteFlags};
+use log::{debug, info, trace, warn};
+use rmps::Serializer;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::errors::BarnError::{DbConfigError, EnvOpenError, TxCommitError};
+use crate::errors::BarnError;
 use crate::schema;
 
 const DB_PRIMARY_KEY_KEY : [u8; 8] = 0_i64.to_le_bytes();
@@ -38,6 +41,7 @@ struct Index {
     unique: bool,
     at_path: String,
     val_type: String,
+    val_format: String,
     flags: WriteFlags
     //key_maker: KeyMaker
 }
@@ -68,51 +72,6 @@ struct ResourceDefaults {
 struct IndexConf {
     attr_path: String,
     unique: Option<bool>
-}
-
-#[derive(Debug, Error)]
-pub enum BarnError {
-    #[error("invalid resource, config validation failed")]
-    InvalidResourceError,
-
-    #[error("could not serialize the given resource")]
-    SerializationError,
-
-    #[error("could not deserialize the given resource")]
-    DeSerializationError,
-
-    #[error("could not open the environment")]
-    EnvOpenError,
-
-    #[error("invalid DB configuration")]
-    DbConfigError,
-
-    #[error("failed to commit transaction")]
-    TxCommitError,
-
-    #[error("failed to begin a new transaction")]
-    TxBeginError,
-
-    #[error("failed to write data")]
-    TxWriteError,
-
-    #[error("failed to read data")]
-    TxReadError,
-
-    #[error("invalid resource data error")]
-    InvalidResourceDataError,
-
-    #[error("resource not found")]
-    ResourceNotFoundError,
-
-    #[error("unknown resource name")]
-    UnknownResourceName,
-
-    #[error("unsupported index value type")]
-    UnsupportedIndexValueType,
-
-    #[error("bad search filter")]
-    BadSearchFilter
 }
 
 impl Barn {
@@ -190,14 +149,23 @@ impl Barn {
                             let at_pointer = format!("/properties/{}", &at_path);
                             let at_def = v.pointer(at_pointer.as_str()).unwrap().as_object().unwrap();
                             let at_type_val : &str;
+                            let mut at_type_format : &str = "";
                             let at_type = at_def.get(&String::from("type"));
                             if let Some(t) = at_type {
                                 at_type_val = at_type.unwrap().as_str().unwrap();
+                                let at_format = at_def.get("format");
+                                if at_format.is_some() {
+                                    at_type_format = at_format.unwrap().as_str().unwrap();
+                                }
                             }
                             else {
                                 let at_ref = at_def.get(&String::from("$ref")).unwrap();
                                 let at_def = schema.pointer(at_ref.as_str().unwrap().strip_prefix("#").unwrap()).unwrap().as_object().unwrap();
                                 at_type_val = at_def.get(&String::from("type")).unwrap().as_str().unwrap();
+                                let at_format = at_def.get("format");
+                                if at_format.is_some() {
+                                    at_type_format = at_format.unwrap().as_str().unwrap();
+                                }
                             }
                             let mut unique = false;
                             if let Some(u) = i.unique {
@@ -224,6 +192,7 @@ impl Barn {
                                     unique,
                                     at_path,
                                     val_type: String::from(at_type_val),
+                                    val_format: String::from(at_type_format),
                                     flags: write_flags
                                 };
 
@@ -405,7 +374,26 @@ impl Index {
             },
             "string" => {
                 if let Some(s) = k.as_str() {
-                    let key_data = s.trim().to_lowercase().into_bytes();
+                    let mut key_data: Vec<u8>;
+                    let match_word = self.val_format.as_str();
+                    match  match_word {
+                        "date-time" => {
+                            key_data = schema::parse_datetime(s)?;
+                        },
+                        "date" => {
+                            let date_with_zero_time = format!("{} 00:00:00", s);
+                            let d = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S");
+                            if let Err(e) = d {
+                                warn!("{}", e);
+                                return Err(BarnError::InvalidAttributeValueError);
+                            }
+                            key_data = d.unwrap().timestamp_millis().to_le_bytes().to_vec();
+                        },
+                        _ => {
+                           key_data = s.trim().to_lowercase().into_bytes();
+                        }
+                    }
+
                     put_result = tx.put(self.db, AsRef::<Vec<u8>>::as_ref(&key_data), &v.to_le_bytes(), self.flags);
                 }
             },
