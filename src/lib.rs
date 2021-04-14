@@ -6,6 +6,7 @@ pub mod barn;
 mod yard;
 pub mod schema;
 pub mod errors;
+pub mod conf;
 
 pub use barn::*;
 pub use crate::schema::*;

@@ -17,6 +17,7 @@ use serde_json::Value;
 use crate::errors::BarnError::{DbConfigError, EnvOpenError, TxCommitError};
 use crate::errors::BarnError;
 use crate::schema;
+use crate::conf::*;
 
 const DB_PRIMARY_KEY_KEY : [u8; 8] = 0_i64.to_le_bytes();
 const DB_READ_START_KEY : [u8; 8] = 1_i64.to_le_bytes();
@@ -44,34 +45,6 @@ struct Index {
     val_format: String,
     flags: WriteFlags
     //key_maker: KeyMaker
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DbConf {
-    db_size: usize,
-    no_sync: bool,
-    allow_conf_resources_only: bool,
-    resource_defaults: ResourceDefaults,
-    resources: HashMap<String, ResourceConf>
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ResourceConf {
-    id_attr_name: Option<String>,
-    id_attr_type: Option<String>,
-    indices: Vec<IndexConf>
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ResourceDefaults {
-    id_attr_name: String,
-    id_attr_type: String
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct IndexConf {
-    attr_path: String,
-    unique: Option<bool>
 }
 
 impl Barn {
