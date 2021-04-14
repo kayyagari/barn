@@ -2,7 +2,7 @@ use jsonschema::JSONSchema;
 use rmps::{Serializer};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value};
-use crate::barn::BarnError;
+use crate::errors::BarnError;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Business {

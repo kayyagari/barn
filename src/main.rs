@@ -11,6 +11,7 @@ use jsonschema_valid::schemas::Draft::*;
 use serde_json::Value;
 
 mod schema;
+mod errors;
 
 //#[cfg(target_os = "linux")]
 // #[global_allocator]

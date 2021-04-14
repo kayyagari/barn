@@ -1,117 +1,60 @@
-use serde_json::{json, Value};
-use lazy_static::*;
+use serde_json::{json, Value, Map};
+use log::{info, warn, trace, debug};
+use crate::errors::BarnError;
 
-#[warn(overflowing_literals)]
-lazy_static! {
-pub static ref SCHEMA_VAL: Value = json!({
-  "$id": "https://example.com/address.schema.json",
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "description": "A business unit",
-  "oneOf": [
-    {
-      "$ref": "#/definitions/Business"
+pub fn get_res_names(sc: &Value) -> Option<Vec<String>> {
+    let obj: &Map<String, Value> = sc.as_object().unwrap();
+    let one_of = obj.get("oneOf");
+    if one_of == None {
+        warn!("there is no oneOf property defined in schema");
+        return None;
     }
-  ],
-  "definitions": {
-    "business_id": {
-      "type": "string",
-      "minLength": 2,
-      "maxLength": 70
-    },
-    "country_code": {
-      "type": "string",
-      "minLength": 2,
-      "maxLength": 2
-    },
-    "display_name": {
-      "type": "string",
-      "minLength": 2,
-      "maxLength": 200
-    },
-    "website": {
-      "type": "string",
-      "minLength": 2,
-      "maxLength": 200
-    },
-    "approved": {
-      "type": "boolean"
-    },
-    "point": {
-      "type": "array",
-      "items": [
-        {
-          "type": "number",
-          "minimum": -90,
-          "maximum": 90
-        },
-        {
-          "type": "number",
-          "minimum": -180,
-          "maximum": 180
-        }
-      ]
-    },
-    "ip_address": {
-      "type": "string",
-      "format": "ipv4"
-    },
-    "timestamp": {
-      "type": "integer",
-      "minimum": 1603171057
-    },
-    "email": {
-      "type": "string",
-      "format": "email"
-    },
-    "Business": {
-      "properties": {
-        "resourceType": {
-          "description": "This is a Business resource",
-          "const": "Business"
-        },
-        "reg_id": {
-          "$ref": "#/definitions/business_id"
-        },
-        "country_code": {
-          "$ref": "#/definitions/country_code"
-        },
-        "display_name": {
-          "$ref": "#/definitions/display_name"
-        },
-        "website": {
-          "$ref": "#/definitions/website"
-        },
-        "approved": {
-          "$ref": "#/definitions/approved"
-        },
-        "location": {
-          "$ref": "#/definitions/point"
-        },
-        "reg_from_location": {
-          "$ref": "#/definitions/point"
-        },
-        "reg_from_ip": {
-          "$ref": "#/definitions/ip_address"
-        },
-        "created_at": {
-          "$ref": "#/definitions/timestamp"
-        },
-        "updated_at": {
-          "$ref": "#/definitions/timestamp"
-        },
-        "account_id": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "category_id": {
-          "type": "integer",
-          "minimum": 1
-        }
-      },
-      "additionalProperties": true,
-      "required": ["reg_id", "country_code", "display_name", "approved", "location",
-        "reg_from_location", "reg_from_ip", "created_at", "account_id", "category_id"]
+
+    let one_of: &Vec<Value> = one_of.unwrap().as_array().unwrap();
+    let mut res_names: Vec<String> = vec!();
+
+    let prefix = "#/definitions/";
+    for v in one_of {
+        let res_obj: &Map<String, Value> = v.as_object().unwrap();
+        let res_def_path = res_obj.get("$ref").unwrap().as_str().unwrap();
+        res_names.push(String::from(res_def_path.strip_prefix(prefix).unwrap()));
     }
-  }
-});
+
+    Some(res_names)
+}
+
+pub fn parse_datetime(s: &str) -> Result<Vec<u8>, BarnError> {
+    let dt = chrono::DateTime::parse_from_rfc3339(s);
+    if let Err(e) = dt {
+        warn!("{}", e);
+        return Err(BarnError::InvalidAttributeValueError);
+    }
+
+    return Ok(dt.unwrap().timestamp_millis().to_le_bytes().to_vec());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_res_names() {
+        let sc = json!({"oneOf": [{"$ref": "#/definitions/Account"}]});
+        let res_names = get_res_names(&sc).unwrap();
+        assert_eq!(vec!("Account"), res_names);
+
+        let sc = json!({"description": "no oneOf element in this"});
+        let res_names = get_res_names(&sc);
+        assert_eq!(None, res_names);
+    }
+
+    #[test]
+    fn test_chrono_utc_parsing() {
+        let val = "2021-01-16T18:36:14+01:00";
+        let dt = chrono::DateTime::parse_from_rfc3339(val).unwrap();
+        println!("{}", dt.timestamp_millis());
+        let d = chrono::NaiveDateTime::parse_from_str("2021-01-16 00:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        println!("{}", &d);
+        println!("{}", d.timestamp_millis());
+    }
 }

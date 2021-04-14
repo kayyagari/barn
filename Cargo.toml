@@ -23,6 +23,7 @@ jsonschema-valid = "0.4.0"
 jsonpath_lib = "0.2.5"
 futures = "0.3.8"
 sqlparser = "0.7.0"
+chrono = "0.4.19"
 
 #[target.'cfg(unix)'.dev-dependencies]
 #jemallocator = "0.3.2"
