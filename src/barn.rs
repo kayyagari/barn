@@ -2,15 +2,14 @@ use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
 use actix_web::web::Bytes;
 use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use jsonpath_lib::Selector;
 use lmdb::{Cursor, Database, DatabaseFlags, Environment, EnvironmentFlags, RoTransaction, RwTransaction, Transaction, WriteFlags};
-use log::{debug, info, trace, warn};
-use rmps::Serializer;
+use log::{debug, info, trace, warn, error};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -18,6 +17,7 @@ use crate::errors::BarnError::{DbConfigError, EnvOpenError, TxCommitError};
 use crate::errors::BarnError;
 use crate::schema;
 use crate::conf::*;
+use thiserror::private::PathAsDisplay;
 
 const DB_PRIMARY_KEY_KEY : [u8; 8] = 0_i64.to_le_bytes();
 const DB_READ_START_KEY : [u8; 8] = 1_i64.to_le_bytes();
@@ -48,46 +48,47 @@ struct Index {
 }
 
 impl Barn {
-    pub fn open<R>(env_dir: &str, db_conf: &DbConf, schema_rdr: R) -> Result<Barn, BarnError>
+    pub fn open<R>(db_path: PathBuf, db_conf: &DbConf, schema_rdr: R) -> Result<Barn, BarnError>
     where R: Read {
-        let r = fs::create_dir_all(env_dir.clone());
-        match r {
-            Err(e) => {
-                warn!("unable to create the db environment directory {}", &env_dir);
-                return Err(EnvOpenError);
-            },
-            Ok(_) => {
-                info!("opened db environment {}", &env_dir);
+        let is_mdb_ext = db_path.to_str().unwrap().ends_with(".mdb");
+        if !db_path.exists() || !is_mdb_ext {
+            let r = fs::create_dir_all(db_path.clone());
+            match r {
+                Err(e) => {
+                    warn!("unable to create the db environment directory {}", db_path.as_display());
+                    return Err(EnvOpenError);
+                },
+                Ok(_) => {
+                }
             }
         }
 
         let schema: Value = serde_json::from_reader(schema_rdr).unwrap();
         let db_size_in_bytes: usize = db_conf.db_size * 1024 * 1024;
         let mut env_flags = EnvironmentFlags::NO_READAHEAD;
+        if db_path.is_file() {
+            env_flags |=  EnvironmentFlags::NO_SUB_DIR;
+        }
+
         if db_conf.no_sync {
             env_flags |= EnvironmentFlags::NO_SYNC;
         }
-        let env = Environment::new().set_flags(env_flags).set_max_dbs(20000).set_map_size(db_size_in_bytes).open(Path::new(&env_dir)).unwrap();
+        let env = Environment::new().set_flags(env_flags).set_max_dbs(20000).set_map_size(db_size_in_bytes).open(db_path.as_path()).unwrap();
+        info!("opened db environment {}", db_path.as_display());
         let mut barrels: HashMap<String, Barrel> = HashMap::new();
 
-        let mut res_names = schema::get_res_names(&schema);
-        if res_names == None {
-            info!("no resource definitions found in the schema's oneOf section, using the resource defined in configuration");
-            let mut tmp = vec!();
-            for k in db_conf.resources.keys() {
-                tmp.push(k.clone());
-            }
-            if tmp.len() != 0 {
-                res_names = Some(tmp);
-            }
-            else {
-                warn!("no resources found either in schema or in configuration");
-                return Err(DbConfigError);
-            }
+        let mut res_names = vec!();
+        for k in db_conf.resources.keys() {
+            res_names.push(k.clone());
+        }
+
+        if res_names.len() == 0 {
+            warn!("no resources found either in schema or in configuration");
+            return Err(DbConfigError);
         }
 
         let tx = env.begin_rw_txn().unwrap();
-        for rname in &res_names.unwrap() {
+        for rname in &res_names {
             let res_conf = db_conf.resources.get(rname);
 
             if db_conf.allow_conf_resources_only && res_conf.is_none() {
@@ -103,26 +104,27 @@ impl Barn {
             }
 
             let mut indices: HashMap<String, Index> = HashMap::new();
-            match res_def {
-                Some(v) => {
-                    let mut id_attr_name = String::from("");
-                    let mut id_attr_type = String::from("");
-                    if res_conf.is_some() {
-                        let res_conf = res_conf.unwrap();
-                        if res_conf.id_attr_name.is_some() {
-                            id_attr_name = res_conf.id_attr_name.as_ref().unwrap().clone();
-                        }
 
-                        if res_conf.id_attr_type.is_some() {
-                            id_attr_type = res_conf.id_attr_type.as_ref().unwrap().clone();
-                        }
+            let mut id_attr_name = String::from("");
+            let mut id_attr_type = String::from("");
+            if res_conf.is_some() {
+                let res_conf = res_conf.unwrap();
+                if res_conf.id_attr_name.is_some() {
+                    id_attr_name = res_conf.id_attr_name.as_ref().unwrap().clone();
+                }
 
-                        for i in &res_conf.indices {
-                            let at_path = i.attr_path.replace(".", "/");
+                if res_conf.id_attr_type.is_some() {
+                    id_attr_type = res_conf.id_attr_type.as_ref().unwrap().clone();
+                }
+
+                for i in &res_conf.indices {
+                    let mut at_type_val : &str = "string";
+                    let mut at_type_format : &str = "";
+                    let mut at_path = i.attr_path.replace(".", "/");
+                    match res_def {
+                        Some(v) => {
                             let at_pointer = format!("/properties/{}", &at_path);
                             let at_def = v.pointer(at_pointer.as_str()).unwrap().as_object().unwrap();
-                            let at_type_val : &str;
-                            let mut at_type_format : &str = "";
                             let at_type = at_def.get(&String::from("type"));
                             if let Some(t) = at_type {
                                 at_type_val = at_type.unwrap().as_str().unwrap();
@@ -140,65 +142,64 @@ impl Barn {
                                     at_type_format = at_format.unwrap().as_str().unwrap();
                                 }
                             }
-                            let mut unique = false;
-                            if let Some(u) = i.unique {
-                                unique = u;
-                            }
-
-                            unsafe {
-                                let index_name = format!("{}_{}", rname, &i.attr_path);
-                                let mut write_flags = WriteFlags::empty();
-                                let mut db_flags = DatabaseFlags::empty();
-                                if !unique {
-                                    db_flags = db_flags | DatabaseFlags::INTEGER_DUP | DatabaseFlags::DUP_SORT | DatabaseFlags::DUP_FIXED;
-                                    write_flags = write_flags | WriteFlags::NO_DUP_DATA;
-                                }
-                                else {
-                                    write_flags = write_flags | WriteFlags::NO_OVERWRITE;
-                                }
-
-                                let db = tx.create_db(Some(index_name.as_str()), db_flags).unwrap();
-                                // prefix with a slash to make it a valid pointer for the object
-                                let at_path = format!("/{}", &at_path);
-                                let idx = Index{
-                                    db,
-                                    unique,
-                                    at_path,
-                                    val_type: String::from(at_type_val),
-                                    val_format: String::from(at_type_format),
-                                    flags: write_flags
-                                };
-
-                                indices.insert(index_name, idx);
-                            }
-                        } // end of creation of indices for one resource
+                        },
+                        _ => {
+                            info!("no resource definition found for {} in schema, using type information from DB configuration", rname);
+                        }
+                    }
+                    let mut unique = false;
+                    if let Some(u) = i.unique {
+                        unique = u;
                     }
 
-                    if id_attr_name.len() == 0 {
-                        id_attr_name = db_conf.resource_defaults.id_attr_name.clone();
-                    }
-
-                    if id_attr_type.len() == 0 {
-                        id_attr_type = db_conf.resource_defaults.id_attr_type.clone();
-                    }
-
-                    // create resource level DB
                     unsafe {
-                        let db = tx.create_db(Some(rname.as_str()), DatabaseFlags::INTEGER_KEY).unwrap();
-                        let barrel = Barrel{
+                        let index_name = format!("{}_{}", rname.to_lowercase(), &i.attr_path);
+                        let mut write_flags = WriteFlags::empty();
+                        let mut db_flags = DatabaseFlags::empty();
+                        if !unique {
+                            db_flags = db_flags | DatabaseFlags::INTEGER_DUP | DatabaseFlags::DUP_SORT | DatabaseFlags::DUP_FIXED;
+                            write_flags = write_flags | WriteFlags::NO_DUP_DATA;
+                        }
+                        else {
+                            write_flags = write_flags | WriteFlags::NO_OVERWRITE;
+                        }
+
+                        let db = tx.create_db(Some(index_name.as_str()), db_flags).unwrap();
+                        // prefix with a slash to make it a valid pointer for the object
+                        at_path = format!("/{}", at_path);
+                        let idx = Index{
                             db,
-                            indices,
-                            id_attr_name,
-                            id_attr_type,
-                            flags: WriteFlags::NO_OVERWRITE
+                            unique,
+                            at_path,
+                            val_type: String::from(at_type_val),
+                            val_format: String::from(at_type_format),
+                            flags: write_flags
                         };
-                        barrels.insert(rname.clone(), barrel);
+
+                        indices.insert(index_name, idx);
                     }
-                },
-                _ => {
-                    warn!("no resource definition found for {}", rname);
-                    return Err(DbConfigError);
-                }
+                } // end of creation of indices for one resource
+            }
+
+            if id_attr_name.len() == 0 {
+                id_attr_name = db_conf.resource_defaults.id_attr_name.clone();
+            }
+
+            if id_attr_type.len() == 0 {
+                id_attr_type = db_conf.resource_defaults.id_attr_type.clone();
+            }
+
+            // create resource level DB
+            unsafe {
+                let db = tx.create_db(Some(rname.to_lowercase().as_str()), DatabaseFlags::INTEGER_KEY).unwrap();
+                let barrel = Barrel{
+                    db,
+                    indices,
+                    id_attr_name,
+                    id_attr_type,
+                    flags: WriteFlags::NO_OVERWRITE
+                };
+                barrels.insert(rname.clone(), barrel);
             }
         }
 
@@ -216,8 +217,8 @@ impl Barn {
         }
     }
 
-    pub fn insert(&self, res_name: String, r: &mut Value) -> Result<(), BarnError> {
-        let barrel = self.barrels.get(res_name.as_str());
+    pub fn insert(&self, res_name: &str, r: &mut Value) -> Result<(), BarnError> {
+        let barrel = self.barrels.get(res_name);
         if let None = barrel {
             return Err(BarnError::UnknownResourceName);
         }
@@ -291,17 +292,16 @@ impl Barn {
             return Err(BarnError::TxReadError);
         }
 
-        let send_result = sn.send(Ok(Bytes::from_static(b"[")));
-
-        let mut send_comma = false;
         // the first row will always be key 0 which stores the PK value, and will be skipped
         for row in cursor.unwrap().iter_from(DB_READ_START_KEY) {
             if let Err(e) = row {
+                error!("{:?}", e);
                 break;
             }
 
             let (key, data) = row.unwrap();
-            let json_val: Value = rmps::from_read_ref(data).unwrap();
+            let r = flexbuffers::Reader::get_root(data).unwrap();
+            let json_val: Value = serde::de::Deserialize::deserialize(r).unwrap();
             let result = compiled_path(&json_val);
             if result.is_ok() {
                 if result.unwrap().len() == 0 {
@@ -310,15 +310,11 @@ impl Barn {
                 let str_result = serde_json::to_vec(&json_val);
                 match str_result {
                     Ok(vec) => {
-                        if send_comma {
-                            let send_result = sn.send(Ok(Bytes::from_static(b",")));
-                        }
                         let send_result = sn.send(Ok(Bytes::from(vec)));
                         if let Err(e) = send_result {
                             warn!("error received while sending search results {:?}", e);
                             break;
                         }
-                        send_comma = true;
                     }
                     Err(e) => {
                         warn!("failed to convert the result to string, stopping further processing {:?}", e);
@@ -328,11 +324,24 @@ impl Barn {
             }
         }
 
-        let send_result = sn.send(Ok(Bytes::from_static(b"]")));
         drop(sn);
         let _ = tx.commit();
 
         Ok(())
+    }
+
+    pub fn close(&mut self) {
+        info!("closing the environment");
+        for (res, b) in &self.barrels {
+            for (idx_name, idx) in &b.indices {
+                unsafe {
+                    self.env.close_db(idx.db);
+                }
+            }
+            unsafe {
+                self.env.close_db(b.db);
+            }
+        }
     }
 }
 
@@ -418,8 +427,8 @@ impl Barrel {
 
         d_obj.insert(self.id_attr_name.clone(), pk_val);
 
-        let mut buf: Vec<u8> = Vec::new();
-        let ser_result = data.serialize(&mut Serializer::new(&mut buf));
+        let mut ser = flexbuffers::FlexbufferSerializer::new();
+        let ser_result = data.serialize(&mut ser);
         match ser_result {
             Ok(_) => {
                 // first update indices, this will catch any unique constraint violations
@@ -431,7 +440,7 @@ impl Barrel {
                 }
 
                 // then update the resource's DB
-                let put_result = tx.put(self.db, &pk.to_le_bytes(), AsRef::<Vec<u8>>::as_ref(&buf), self.flags);
+                let put_result = tx.put(self.db, &pk.to_le_bytes(), &ser.view(), self.flags);
                 if let Err(_) = put_result {
                     return Err(BarnError::TxWriteError);
                 }
@@ -464,7 +473,8 @@ impl Barrel {
                 Err(BarnError::ResourceNotFoundError)
             },
             Ok(data) => {
-                let val_result = rmps::from_read(data);
+                let r = flexbuffers::Reader::get_root(data).unwrap();
+                let val_result = serde::de::Deserialize::deserialize(r);
                 match val_result {
                     Ok(val) => {
                         /*let d_obj = val.as_object_mut().unwrap();
