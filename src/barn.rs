@@ -19,6 +19,7 @@ use crate::conf::*;
 use crate::errors::BarnError::{DbConfigError, EnvOpenError, TxCommitError};
 use crate::errors::BarnError;
 use crate::schema;
+use rawbson::DocBuf;
 
 const DB_PRIMARY_KEY_KEY : [u8; 8] = 0_i64.to_le_bytes();
 const DB_READ_START_KEY : [u8; 8] = 1_i64.to_le_bytes();
@@ -236,33 +237,44 @@ impl Barn {
             }
 
             let (key, mut data) = row.unwrap();
-            let result = Document::from_reader(&mut data.as_ref());
-            //let result = compiled_path(&json_val);
-            match result {
-                Ok(vec) => {
-                    //let mut data = Vec::new();
-
-                    count += 1;
-                    let beic = vec.get("Business_Entities_in_Colorado");
-                    if beic.is_some() {
-                        let entity_id = beic.unwrap().as_document().unwrap().get("entityid");
-                        if entity_id.is_some() {
-                            let entityid = entity_id.unwrap().as_str().unwrap();
-                            if entityid == "20201233700" {
-                                let send_result = sn.send(Ok(vec.to_string().as_bytes().to_owned()));
-                                if let Err(e) = send_result {
-                                    warn!("error received while sending search results {:?}", e);
-                                    break;
+            unsafe {
+                let result = DocBuf::new_unchecked(Vec::from(data));
+                count += 1;
+                let beic = result.get("Business_Entities_in_Colorado");
+                match beic {
+                    Ok(elm) => {
+                        if elm.is_some() {
+                            let elm = elm.unwrap();
+                            let entity_id = elm.as_document().unwrap().get("entityid");
+                            if entity_id.is_ok() {
+                                let entityid = entity_id.unwrap().unwrap().as_str().unwrap();
+                                if entityid == "20211051117" {
+                                    let send_result = sn.send(Ok(result.as_bytes().to_owned()));
+                                    if let Err(e) = send_result {
+                                        warn!("error received while sending search results {:?}", e);
+                                        break;
+                                    }
                                 }
                             }
                         }
+                    },
+                    Err(e) => {
+                        warn!("failed to parse BSON document, stopping further processing {:?}", e);
+                        break;
                     }
                 }
-                Err(e) => {
-                    warn!("failed to parse BSON document, stopping further processing {:?}", e);
-                    break;
-                }
             }
+            //let result = Document::from_reader(&mut data.as_ref());
+            //let result = compiled_path(&json_val);
+            // match result {
+            //     Ok(vec) => {
+            //         //let mut data = Vec::new();
+            //     }
+            //     Err(e) => {
+            //         warn!("failed to parse BSON document, stopping further processing {:?}", e);
+            //         break;
+            //     }
+            // }
         }
 
         drop(sn);
@@ -368,9 +380,9 @@ impl Barrel {
         // }
 
         // then update the resource's DB
-        let mut byte_data: Vec<u8> = Vec::new();
-        data.to_writer(&mut byte_data);
-        let put_result = self.db.put(&pk.to_le_bytes(), AsRef::<Vec<u8>>::as_ref(&byte_data));
+        let doc_buf = DocBuf::from_document(&data);
+
+        let put_result = self.db.put(&pk.to_le_bytes(), doc_buf.as_bytes());
         if let Err(_) = put_result {
             return Err(BarnError::TxWriteError);
         }
