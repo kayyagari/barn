@@ -1,5 +1,3 @@
-extern crate flexbuffers;
-
 use std::fs;
 use std::fs::File;
 use std::path::PathBuf;
@@ -27,18 +25,6 @@ mod http;
 // static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 fn main() {
-    /*
-    let val: Value = json!({"name": "k", "id": 7});
-    let mut flex_ser = flexbuffers::FlexbufferSerializer::new();
-    val.serialize(&mut flex_ser).unwrap();
-    //(&mut flex_ser).take_buffer().clone();
-
-    println!("Data stored in {:?} bytes.", flex_ser.view().len());
-    let r = flexbuffers::Reader::get_root(flex_ser.view()).unwrap();
-    println!("{}", r);
-    let val2: Value = serde::de::Deserialize::deserialize(r).unwrap();
-    println!("{}", val2);
-     */
     configure_log4rs();
     let cmd_line: conf::CmdLine = conf::CmdLine::from_args();
     match cmd_line.sub {
@@ -80,7 +66,7 @@ fn main() {
         }
     }
 }
-
+/*
 #[actix_web::main]
 async fn main1() -> std::io::Result<()> {
     configure_log4rs();
@@ -142,7 +128,7 @@ async fn main1() -> std::io::Result<()> {
     .run()
     .await
 }
-
+*/
 fn configure_log4rs() {
     let stdout = ConsoleAppender::builder().build();
 

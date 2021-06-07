@@ -6,44 +6,42 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
 use actix_web::web::Bytes;
+use bson::{Bson, Document};
 use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use jsonpath_lib::Selector;
-use lmdb::{Cursor, Database, DatabaseFlags, Environment, EnvironmentFlags, RoTransaction, RwTransaction, Transaction, WriteFlags};
-use log::{debug, info, trace, warn, error};
+use log::{debug, error, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use thiserror::private::PathAsDisplay;
+use rocksdb::{Env, DB, Options, IteratorMode};
 
+use crate::conf::*;
 use crate::errors::BarnError::{DbConfigError, EnvOpenError, TxCommitError};
 use crate::errors::BarnError;
 use crate::schema;
-use crate::conf::*;
-use thiserror::private::PathAsDisplay;
 
 const DB_PRIMARY_KEY_KEY : [u8; 8] = 0_i64.to_le_bytes();
 const DB_READ_START_KEY : [u8; 8] = 1_i64.to_le_bytes();
-const PK_WRITE_FLAGS: WriteFlags = WriteFlags::empty();
 
 pub struct Barn {
-    env: Environment,
+    env: Env,
     barrels: HashMap<String, Barrel>,
     pub schema: Box<Value>
 }
 
 struct Barrel {
-    db: Database,
+    db: DB,
     id_attr_name: String,
     id_attr_type: String,
-    indices: HashMap<String, Index>,
-    flags: WriteFlags
+    indices: HashMap<String, Index>
 }
 
 struct Index {
-    db: Database,
+    name: String,
     unique: bool,
     at_path: String,
     val_type: String,
-    val_format: String,
-    flags: WriteFlags
+    val_format: String
     //key_maker: KeyMaker
 }
 
@@ -64,17 +62,8 @@ impl Barn {
         }
 
         let schema: Value = serde_json::from_reader(schema_rdr).unwrap();
-        let db_size_in_bytes: usize = db_conf.db_size * 1024 * 1024;
-        let mut env_flags = EnvironmentFlags::NO_READAHEAD;
-        if db_path.is_file() {
-            env_flags |=  EnvironmentFlags::NO_SUB_DIR;
-        }
-
-        if db_conf.no_sync {
-            env_flags |= EnvironmentFlags::NO_SYNC;
-        }
-        let env = Environment::new().set_flags(env_flags).set_max_dbs(20000).set_map_size(db_size_in_bytes).open(db_path.as_path()).unwrap();
-        info!("opened db environment {}", db_path.as_display());
+        let env = Env::default().unwrap();
+        info!("opened db environment");
         let mut barrels: HashMap<String, Barrel> = HashMap::new();
 
         let mut res_names = vec!();
@@ -87,7 +76,6 @@ impl Barn {
             return Err(DbConfigError);
         }
 
-        let tx = env.begin_rw_txn().unwrap();
         for rname in &res_names {
             let res_conf = db_conf.resources.get(rname);
 
@@ -104,6 +92,14 @@ impl Barn {
             }
 
             let mut indices: HashMap<String, Index> = HashMap::new();
+
+            let mut res_db_opts = Options::default();
+            res_db_opts.create_if_missing(true);
+            res_db_opts.create_missing_column_families(true);
+            res_db_opts.set_env(&env);
+            let mut res_db_path = PathBuf::from(&db_path);
+            res_db_path.push(rname.to_lowercase());
+            let mut res_db = DB::open(&res_db_opts, &res_db_path).unwrap();
 
             let mut id_attr_name = String::from("");
             let mut id_attr_type = String::from("");
@@ -152,32 +148,19 @@ impl Barn {
                         unique = u;
                     }
 
-                    unsafe {
-                        let index_name = format!("{}_{}", rname.to_lowercase(), &i.attr_path);
-                        let mut write_flags = WriteFlags::empty();
-                        let mut db_flags = DatabaseFlags::empty();
-                        if !unique {
-                            db_flags = db_flags | DatabaseFlags::INTEGER_DUP | DatabaseFlags::DUP_SORT | DatabaseFlags::DUP_FIXED;
-                            write_flags = write_flags | WriteFlags::NO_DUP_DATA;
-                        }
-                        else {
-                            write_flags = write_flags | WriteFlags::NO_OVERWRITE;
-                        }
+                    let index_name = format!("{}_{}", rname.to_lowercase(), &i.attr_path);
+                    res_db.create_cf(index_name.as_str(), &res_db_opts);
+                    // prefix with a slash to make it a valid pointer for the object
+                    at_path = format!("/{}", at_path);
+                    let idx = Index{
+                        name: index_name.clone(),
+                        unique,
+                        at_path,
+                        val_type: String::from(at_type_val),
+                        val_format: String::from(at_type_format)
+                    };
 
-                        let db = tx.create_db(Some(index_name.as_str()), db_flags).unwrap();
-                        // prefix with a slash to make it a valid pointer for the object
-                        at_path = format!("/{}", at_path);
-                        let idx = Index{
-                            db,
-                            unique,
-                            at_path,
-                            val_type: String::from(at_type_val),
-                            val_format: String::from(at_type_format),
-                            flags: write_flags
-                        };
-
-                        indices.insert(index_name, idx);
-                    }
+                    indices.insert(index_name, idx);
                 } // end of creation of indices for one resource
             }
 
@@ -190,143 +173,101 @@ impl Barn {
             }
 
             // create resource level DB
-            unsafe {
-                let db = tx.create_db(Some(rname.to_lowercase().as_str()), DatabaseFlags::INTEGER_KEY).unwrap();
-                let barrel = Barrel{
-                    db,
-                    indices,
-                    id_attr_name,
-                    id_attr_type,
-                    flags: WriteFlags::NO_OVERWRITE
-                };
-                barrels.insert(rname.clone(), barrel);
-            }
+            let barrel = Barrel{
+                db: res_db,
+                indices,
+                id_attr_name,
+                id_attr_type
+            };
+            barrels.insert(rname.clone(), barrel);
+            info!("opened resource db {}", res_db_path.as_display());
         }
 
-        match tx.commit() {
-            Ok(_) => {
-                Ok(Barn {
-                    env,
-                    barrels,
-                    schema: Box::new(schema)
-                })
-            },
-            Err(e) => {
-                Err(TxCommitError)
-            }
-        }
+        Ok(Barn {
+            env,
+            barrels,
+            schema: Box::new(schema)
+        })
     }
 
-    pub fn insert(&self, res_name: &str, r: &mut Value) -> Result<(), BarnError> {
+    pub fn insert(&self, res_name: &str, r: &mut Document) -> Result<(), BarnError> {
         let barrel = self.barrels.get(res_name);
         if let None = barrel {
             return Err(BarnError::UnknownResourceName);
         }
 
-        let tx_result = self.env.begin_rw_txn();
-
-        match tx_result {
-            Ok(mut tx) => {
-                let barrel_result = barrel.unwrap().insert(&mut tx, r);
-                match barrel_result {
-                    Ok(_) => {
-                        match tx.commit() {
-                            Ok(_) => {
-                                Ok(())
-                            },
-                            Err(e) => {
-                                warn!("failed to insert resource {}", e);
-                                Err(BarnError::TxCommitError)
-                            }
-                        }
-                    },
-                    Err(e) => {
-                        warn!("aborting transaction due to {}", e);
-                        tx.abort();
-                        Err(e)
-                    }
-                }
-            },
-            Err(e) => {
-                Err(BarnError::TxBeginError)
-            }
+        let barrel_result = barrel.unwrap().insert(r);
+        if let Err(e) = barrel_result {
+            warn!("aborting transaction due to {}", e);
+            return Err(e);
         }
+
+        Ok(())
     }
 
-    pub fn get(&self, id: u64, res_name: String) -> Result<Value, BarnError> {
+    pub fn get(&self, id: u64, res_name: String) -> Result<Document, BarnError> {
         let barrel = self.barrels.get(res_name.as_str());
         if let None = barrel {
             return Err(BarnError::UnknownResourceName);
         }
 
-        let tx_result = self.env.begin_ro_txn();
-        match tx_result {
-            Ok(tx) => {
-                let val_result = barrel.unwrap().get(id, &tx);
-                let _ = tx.commit();
-                val_result
-            },
-            Err(e) => {
-                Err(BarnError::TxBeginError)
-            }
-        }
+        barrel.unwrap().get(id)
     }
 
-    pub fn search(&self, res_name: String, expr: String, sn: Sender<Result<Bytes, std::io::Error>>) -> Result<(), BarnError> {
+    pub fn search(&self, res_name: String, expr: String, sn: Sender<Result<Vec<u8>, std::io::Error>>) -> Result<(), BarnError> {
         let barrel = self.barrels.get(res_name.as_str());
         if let None = barrel {
             return Err(BarnError::UnknownResourceName);
-        }
-
-        let tx_result = self.env.begin_ro_txn();
-        if let Err(e) = tx_result {
-            return Err(BarnError::TxBeginError);
         }
 
         let mut compiled_path = jsonpath_lib::compile(expr.as_str());
 
         let barrel = barrel.unwrap();
-        let tx = tx_result.unwrap();
-        let cursor = tx.open_ro_cursor(barrel.db);
-        if let Err(e) = cursor {
-            return Err(BarnError::TxReadError);
-        }
+        let mut cursor = barrel.db.iterator(IteratorMode::Start);
 
         // the first row will always be key 0 which stores the PK value, and will be skipped
-        for row in cursor.unwrap().iter_from(DB_READ_START_KEY) {
-            if let Err(e) = row {
-                error!("{:?}", e);
+        cursor.next();
+
+        let mut count = 0;
+        loop {
+            let row = cursor.next();
+            if None == row {
                 break;
             }
 
-            let (key, data) = row.unwrap();
-            let r = flexbuffers::Reader::get_root(data).unwrap();
-            let json_val: Value = serde::de::Deserialize::deserialize(r).unwrap();
-            let result = compiled_path(&json_val);
-            if result.is_ok() {
-                if result.unwrap().len() == 0 {
-                    continue;
-                }
-                let str_result = serde_json::to_vec(&json_val);
-                match str_result {
-                    Ok(vec) => {
-                        let send_result = sn.send(Ok(Bytes::from(vec)));
-                        if let Err(e) = send_result {
-                            warn!("error received while sending search results {:?}", e);
-                            break;
+            let (key, mut data) = row.unwrap();
+            let result = Document::from_reader(&mut data.as_ref());
+            //let result = compiled_path(&json_val);
+            match result {
+                Ok(vec) => {
+                    //let mut data = Vec::new();
+
+                    count += 1;
+                    let beic = vec.get("Business_Entities_in_Colorado");
+                    if beic.is_some() {
+                        let entity_id = beic.unwrap().as_document().unwrap().get("entityid");
+                        if entity_id.is_some() {
+                            let entityid = entity_id.unwrap().as_str().unwrap();
+                            if entityid == "20201233700" {
+                                let send_result = sn.send(Ok(vec.to_string().as_bytes().to_owned()));
+                                if let Err(e) = send_result {
+                                    warn!("error received while sending search results {:?}", e);
+                                    break;
+                                }
+                            }
                         }
                     }
-                    Err(e) => {
-                        warn!("failed to convert the result to string, stopping further processing {:?}", e);
-                        break;
-                    }
+                }
+                Err(e) => {
+                    warn!("failed to parse BSON document, stopping further processing {:?}", e);
+                    break;
                 }
             }
         }
 
         drop(sn);
-        let _ = tx.commit();
 
+        println!("read {} entries", count);
         Ok(())
     }
 
@@ -334,24 +275,20 @@ impl Barn {
         info!("closing the environment");
         for (res, b) in &self.barrels {
             for (idx_name, idx) in &b.indices {
-                unsafe {
-                    self.env.close_db(idx.db);
-                }
             }
-            unsafe {
-                self.env.close_db(b.db);
-            }
+            b.db.flush();
         }
     }
 }
 
 impl Index {
-    fn insert(&self, tx: &mut RwTransaction, k: &Value, v: u64) -> Result<(), BarnError> {
-        let mut put_result = Err(lmdb::Error::from_err_code(-1));
+    fn insert(&self, db: &mut DB, k: &Value, v: u64) -> Result<(), BarnError> {
+        let cf_handle = db.cf_handle(self.name.as_str()).unwrap();
+        let mut put_result = Ok(());
         match self.val_type.as_str() {
             "integer" => {
                 if let Some(i) = k.as_i64() {
-                    put_result = tx.put(self.db, &i.to_le_bytes(), &v.to_le_bytes(), self.flags);
+                    put_result = db.put_cf(cf_handle, &i.to_le_bytes(), &v.to_le_bytes());
                 }
             },
             "string" => {
@@ -376,12 +313,12 @@ impl Index {
                         }
                     }
 
-                    put_result = tx.put(self.db, AsRef::<Vec<u8>>::as_ref(&key_data), &v.to_le_bytes(), self.flags);
+                    put_result = db.put_cf(cf_handle, AsRef::<Vec<u8>>::as_ref(&key_data), &v.to_le_bytes());
                 }
             },
             "number" => {
                 if let Some(f) = k.as_f64() {
-                    put_result = tx.put(self.db, &f.to_le_bytes(), &v.to_le_bytes(), self.flags);
+                    put_result = db.put_cf(cf_handle, &f.to_le_bytes(), &v.to_le_bytes());
                 }
             },
             _ => {
@@ -397,85 +334,71 @@ impl Index {
 }
 
 impl Barrel {
-    fn insert(&self, tx: &mut RwTransaction, data : &mut Value) -> Result<(), BarnError> {
-        let d_obj = data.as_object_mut();
-        if let None = d_obj {
-            return Err(BarnError::InvalidResourceDataError);
-        }
-
-        let d_obj = d_obj.unwrap();
-        let pk_result = tx.get(self.db, &DB_PRIMARY_KEY_KEY);
+    fn insert(&self, data : &mut Document) -> Result<(), BarnError> {
+        let pk_result = self.db.get(&DB_PRIMARY_KEY_KEY);
         let mut pk: u64 = 1;
         if let Ok(r) = pk_result {
-            pk = u64::from_le_bytes(r.try_into().unwrap());
-            pk += 1;
+            if r.is_some() {
+                pk = from_le_bytes(&r.unwrap());
+                pk += 1;
+            }
         }
 
         let pk_val;
         match self.id_attr_type.as_str() {
             "string" => {
-                pk_val = Value::from(format!("{}", pk));
+                pk_val = Bson::from(format!("{}", pk));
             },
             _ => {
-                pk_val = Value::from(pk);
+                pk_val = Bson::from(pk);
             }
         }
-        let pk_existing_attr = d_obj.remove(&self.id_attr_name);
+        let pk_existing_attr = data.remove(&self.id_attr_name);
         if let Some(id_val) = pk_existing_attr {
             trace!("dropping the value {} given for ID attribute {}", &id_val, &self.id_attr_name);
         }
 
-        d_obj.insert(self.id_attr_name.clone(), pk_val);
+        data.insert(self.id_attr_name.clone(), pk_val);
 
-        let mut ser = flexbuffers::FlexbufferSerializer::new();
-        let ser_result = data.serialize(&mut ser);
-        match ser_result {
-            Ok(_) => {
-                // first update indices, this will catch any unique constraint violations
-                for (at_name, i) in &self.indices {
-                    let at = data.pointer(&i.at_path);
-                    if let Some(at_val) = at {
-                        i.insert(tx, at_val, pk)?;
-                    }
-                }
+        // for (at_name, i) in &self.indices {
+        //     let at = data.pointer(&i.at_path);
+        //     if let Some(at_val) = at {
+        //         i.insert(tx, at_val, pk)?;
+        //     }
+        // }
 
-                // then update the resource's DB
-                let put_result = tx.put(self.db, &pk.to_le_bytes(), &ser.view(), self.flags);
-                if let Err(_) = put_result {
-                    return Err(BarnError::TxWriteError);
-                }
+        // then update the resource's DB
+        let mut byte_data: Vec<u8> = Vec::new();
+        data.to_writer(&mut byte_data);
+        let put_result = self.db.put(&pk.to_le_bytes(), AsRef::<Vec<u8>>::as_ref(&byte_data));
+        if let Err(_) = put_result {
+            return Err(BarnError::TxWriteError);
+        }
 
-                // store the updated PK value
-                let put_result = tx.put(self.db, &DB_PRIMARY_KEY_KEY, &pk.to_le_bytes(), PK_WRITE_FLAGS);
-                if let Err(e) = put_result {
-                    return Err(BarnError::TxWriteError);
-                }
-            },
-            Err(e) => {
-                warn!("{:#?}", e);
-                return Err(BarnError::SerializationError);
-            }
+        // store the updated PK value
+        let put_result = self.db.put(&DB_PRIMARY_KEY_KEY, &pk.to_le_bytes());
+        if let Err(e) = put_result {
+            return Err(BarnError::TxWriteError);
         }
 
         Ok(())
     }
 
-    fn get(&self, id: u64, tx: &RoTransaction) -> Result<Value, BarnError> {
+    fn get(&self, id: u64) -> Result<Document, BarnError> {
         if id <= 0 {
             debug!("invalid resource identifier {}", id);
             return Err(BarnError::ResourceNotFoundError);
         }
 
-        let get_result = tx.get(self.db, &id.to_le_bytes());
+        let get_result = self.db.get(&id.to_le_bytes());
         match get_result {
             Err(e) => {
                 debug!("resource not found with identifier {}", id);
                 Err(BarnError::ResourceNotFoundError)
             },
-            Ok(data) => {
-                let r = flexbuffers::Reader::get_root(data).unwrap();
-                let val_result = serde::de::Deserialize::deserialize(r);
-                match val_result {
+            Ok(mut data) => {
+                let result = Document::from_reader(&mut data.unwrap().as_slice());
+                match result {
                     Ok(val) => {
                         /*let d_obj = val.as_object_mut().unwrap();
                         let id_val;
@@ -499,18 +422,28 @@ impl Barrel {
         }
     }
 }
+
+fn from_le_bytes(b: &Vec<u8>) -> u64 {
+    let mut d : u64 = 0;
+    for i in 0..7 {
+        d |= (b[i] as u64) << i*8
+    }
+
+    d
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_open_barn() {
-        let env_dir = String::from("/tmp/barn");
+        let env_dir = PathBuf::from("/tmp/barn");
         let schema_file = fs::File::open("config/schema.json").unwrap();
         let db_conf_file = fs::File::open("config/db-conf.json").unwrap();
         let db_conf = serde_json::from_reader(db_conf_file).unwrap();
 
-        let result = Barn::open(&env_dir, &db_conf, schema_file);
+        let result = Barn::open(env_dir, &db_conf, schema_file);
         match result {
             Ok(ref b) => {
                 let dir = fs::read_dir(Path::new(&env_dir));

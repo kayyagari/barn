@@ -9,6 +9,8 @@ use thiserror::Error;
 
 use crate::barn;
 use crate::errors::BarnError;
+use bson::{Document, Bson};
+use serde::Serialize;
 
 #[derive(Debug, Error)]
 pub enum LoadError {
@@ -43,15 +45,19 @@ pub fn load_data<R>(source: R, res_name: &str, barn: &barn::Barn, ignore_errors:
 
         let val: serde_json::Result<Value> = serde_json::from_reader(buf.as_slice());
 
+
         match val {
             Err(e) => {
+                warn!("{:?}", e);
                 if !ignore_errors {
                     return Err(LoadError::InvalidRecord(e));
                 }
             }
 
-            Ok(mut v) => {
-                let result = barn.insert(res_name, &mut v);
+            Ok(v) => {
+                let bson_val = v.serialize(bson::Serializer::new()).unwrap();
+                let mut doc = bson_val.as_document().unwrap().to_owned();
+                let result = barn.insert(res_name, &mut doc);
                 if let Err(e) = result {
                     return Err(LoadError::InsertionError(e));
                 }
@@ -74,6 +80,7 @@ where W: Write {
         return Err(LoadError::SearchError);
     }
 
+    info!("waiting for data to receive in the channel");
     let new_line = b"\n";
     let mut iter = rc.iter();
     loop {

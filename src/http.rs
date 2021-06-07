@@ -27,7 +27,7 @@ pub async fn echo(ad: web::Data<AppData<'_>>) -> impl Responder {
 
 #[post("/{name}")]
 pub async fn insert(r: Json<Value>, Path(res_name): Path<String>, req: HttpRequest, ad: Data<AppData<'_>>) -> impl Responder {
-    let mut r = r.into_inner();
+    //let mut r = r.into_inner();
     // let valid = ad.validator.validate(&r);
     // if let Err(e) = valid {
     //     for i in e {
@@ -36,11 +36,11 @@ pub async fn insert(r: Json<Value>, Path(res_name): Path<String>, req: HttpReque
     //     return HttpResponse::BadRequest();
     // }
     // drop(valid);
-    let insert_result = ad.barn.insert(res_name.as_str(), &mut r);
-    if let Err(e) = insert_result {
-        warn!("{}", e);
-        return HttpResponse::InternalServerError();
-    }
+    // let insert_result = ad.barn.insert(res_name.as_str(), &mut r);
+    // if let Err(e) = insert_result {
+    //     warn!("{}", e);
+    //     return HttpResponse::InternalServerError();
+    // }
 
     HttpResponse::Created()
 }
@@ -71,7 +71,7 @@ pub async fn search(Path(res_name): Path<String>, query: Query<SearchRequest>, r
     }
 
     HttpResponse::Ok()
-        .content_type("application/json")
-        .streaming(futures::stream::iter(rc))
+        .content_type("application/json").finish()
+        //.streaming(futures::stream::iter(rc))
 }
 
