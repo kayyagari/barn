@@ -30,6 +30,17 @@ pub enum LoadError {
 
 pub fn load_data<R>(source: R, res_name: &str, barn: &barn::Barn, ignore_errors: bool) -> Result<(), LoadError>
     where R: Read {
+    let result = barn.bulk_load(source, res_name, ignore_errors);
+
+    if let Err(e) = result {
+        return Err(LoadError::InsertionError(e));
+    }
+
+    Ok(())
+}
+
+pub fn _load_data<R>(source: R, res_name: &str, barn: &barn::Barn, ignore_errors: bool) -> Result<(), LoadError>
+    where R: Read {
     let mut reader = BufReader::new(source);
     let mut buf: Vec<u8> = Vec::new();
     let mut count: u64 = 0;

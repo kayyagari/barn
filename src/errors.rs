@@ -45,5 +45,8 @@ pub enum BarnError {
     UnsupportedIndexValueType,
 
     #[error("bad search filter")]
-    BadSearchFilter
+    BadSearchFilter,
+
+    #[error("IO error")]
+    IOError(#[from] std::io::Error),
 }

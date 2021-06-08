@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
@@ -13,13 +13,14 @@ use log::{debug, error, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::private::PathAsDisplay;
-use rocksdb::{Env, DB, Options, IteratorMode, DBCompressionType};
+use rocksdb::{Env, DB, Options, IteratorMode, DBCompressionType, IngestExternalFileOptions};
 
 use crate::conf::*;
 use crate::errors::BarnError::{DbConfigError, EnvOpenError, TxCommitError};
 use crate::errors::BarnError;
 use crate::schema;
 use rawbson::DocBuf;
+use std::cmp::Ordering;
 
 const DB_PRIMARY_KEY_KEY : [u8; 8] = 0_i64.to_le_bytes();
 const DB_READ_START_KEY : [u8; 8] = 1_i64.to_le_bytes();
@@ -32,6 +33,7 @@ pub struct Barn {
 
 struct Barrel {
     db: DB,
+    opts: Options,
     id_attr_name: String,
     id_attr_type: String,
     indices: HashMap<String, Index>
@@ -77,7 +79,8 @@ impl Barn {
             return Err(DbConfigError);
         }
 
-        let num_cores = num_cpus::get() as i32;
+        let cpu_count = num_cpus::get() as i32;
+        debug!("number of CPUs {}", cpu_count);
 
         for rname in &res_names {
             let res_conf = db_conf.resources.get(rname);
@@ -103,7 +106,7 @@ impl Barn {
             res_db_opts.set_compression_type(DBCompressionType::Snappy);
             res_db_opts.set_use_direct_io_for_flush_and_compaction(true);
             res_db_opts.set_writable_file_max_buffer_size(100 * 1024 * 1024); // 100 MB
-            res_db_opts.increase_parallelism(num_cores);
+            res_db_opts.increase_parallelism(cpu_count);
 
             //res_db_opts.set_use_direct_reads(true);
             //res_db_opts.set_compaction_readahead_size(5 * 1024 * 1024);
@@ -186,6 +189,7 @@ impl Barn {
             // create resource level DB
             let barrel = Barrel{
                 db: res_db,
+                opts: res_db_opts,
                 indices,
                 id_attr_name,
                 id_attr_type
@@ -258,7 +262,7 @@ impl Barn {
                             let entity_id = elm.as_document().unwrap().get("entityid");
                             if entity_id.is_ok() {
                                 let entityid = entity_id.unwrap().unwrap().as_str().unwrap();
-                                if entityid == "20211051117" {
+                                if entityid == "20201233700" {
                                     let send_result = sn.send(Ok(result.as_bytes().to_owned()));
                                     if let Err(e) = send_result {
                                         warn!("error received while sending search results {:?}", e);
@@ -291,6 +295,16 @@ impl Barn {
 
         println!("read {} entries", count);
         Ok(())
+    }
+
+    pub fn bulk_load<R>(&self, source: R, res_name: &str, ignore_errors: bool) -> Result<(), BarnError>
+        where R: Read {
+        let barrel = self.barrels.get(res_name);
+        if let None = barrel {
+            return Err(BarnError::UnknownResourceName);
+        }
+
+        barrel.unwrap().bulk_load(source, ignore_errors)
     }
 
     pub fn close(&mut self) {
@@ -366,21 +380,7 @@ impl Barrel {
             }
         }
 
-        let pk_val;
-        match self.id_attr_type.as_str() {
-            "string" => {
-                pk_val = Bson::from(format!("{}", pk));
-            },
-            _ => {
-                pk_val = Bson::from(pk);
-            }
-        }
-        let pk_existing_attr = data.remove(&self.id_attr_name);
-        if let Some(id_val) = pk_existing_attr {
-            trace!("dropping the value {} given for ID attribute {}", &id_val, &self.id_attr_name);
-        }
-
-        data.insert(self.id_attr_name.clone(), pk_val);
+        self.add_id_to_doc(data, pk);
 
         // for (at_name, i) in &self.indices {
         //     let at = data.pointer(&i.at_path);
@@ -442,6 +442,143 @@ impl Barrel {
                 }
             }
         }
+    }
+
+    fn add_id_to_doc(&self, data: &mut Document, pk: u64) {
+        let pk_val;
+        match self.id_attr_type.as_str() {
+            "string" => {
+                pk_val = Bson::from(format!("{}", pk));
+            },
+            _ => {
+                pk_val = Bson::from(pk);
+            }
+        }
+        let pk_existing_attr = data.remove(&self.id_attr_name);
+        if let Some(id_val) = pk_existing_attr {
+            trace!("dropping the value {} given for ID attribute {}", &id_val, &self.id_attr_name);
+        }
+
+        data.insert(self.id_attr_name.clone(), pk_val);
+    }
+
+    fn bulk_load<R>(&self, source: R, ignore_errors: bool) -> Result<(), BarnError>
+    where R: Read {
+        let pk_result = self.db.get(&DB_PRIMARY_KEY_KEY);
+        let mut pk: u64 = 1;
+        if let Ok(r) = pk_result {
+            if r.is_some() {
+                pk = from_le_bytes(&r.unwrap());
+            }
+        }
+
+        let mut reader = BufReader::new(source);
+        let mut buf: Vec<u8> = Vec::new();
+        let mut count: u64 = 0;
+        let sst_batch_size: u64 = 200_000;
+        let mut sst_files: Vec<PathBuf> = Vec::new();
+        let mut sst_temp_dir = PathBuf::new();
+        sst_temp_dir.push(self.db.path());
+        sst_temp_dir.push("__bulk_temp");
+
+        let dir_result = fs::create_dir(sst_temp_dir.as_path());
+        if let Err(e) = dir_result {
+            warn!("failed to created the temporary directory {:?} to store SST files {:?}", sst_temp_dir.as_path(), e);
+            return Err(BarnError::IOError(e));
+        }
+
+        let mut err: Option<BarnError> = None;
+
+        let mut sst_file: rocksdb::SstFileWriter = rocksdb::SstFileWriter::create(&self.opts);
+        loop {
+            let byte_count = reader.read_until(b'\n', &mut buf);
+            if let Err(e) = byte_count {
+                err = Some(BarnError::IOError(e));
+                break;
+            }
+            let byte_count = byte_count.unwrap();
+            if byte_count <= 0 {
+                break;
+            }
+
+            if count % sst_batch_size == 0 {
+                if count != 0 {
+                    sst_file.finish();
+                }
+                sst_file = rocksdb::SstFileWriter::create(&self.opts);
+                let mut p = PathBuf::from(&sst_temp_dir);
+                p.push(format!("file{}.sst", pk));
+                let open_result = sst_file.open(&p);
+                if let Err(e) = open_result {
+                    warn!("failed to create new SST file {:?} {:?}", &p, e);
+                    break;
+                }
+                sst_files.push(PathBuf::from(String::from(p.to_str().unwrap())));
+            }
+
+            let val: serde_json::Result<Value> = serde_json::from_reader(buf.as_slice());
+
+            match val {
+                Err(e) => {
+                    warn!("failed to parse record {:?}", e);
+                    if !ignore_errors {
+                        err = Some(BarnError::InvalidResourceError);
+                        break;
+                    }
+                }
+
+                Ok(v) => {
+                    let bson_val = v.serialize(bson::Serializer::new()).unwrap();
+                    let mut doc = bson_val.as_document().unwrap().to_owned();
+                    self.add_id_to_doc(&mut doc, pk);
+                    let doc_buf = DocBuf::from_document(&doc);
+
+                    pk += 1;
+                    let put_result = sst_file.put(&pk.to_le_bytes(), doc_buf.as_bytes());
+                    if let Err(e) = put_result {
+                        warn!("failed to store record {:?}", e);
+                        err = Some(BarnError::TxWriteError);
+                        break;
+                    }
+
+                    count += 1;
+
+                    if count > sst_batch_size {
+                        break;
+                    }
+                }
+            }
+            buf.clear();
+        }
+
+        info!("merging {} files", sst_files.len());
+        if !sst_files.is_empty() {
+            sst_file.finish(); // this is the last file
+            let mut ingest_opts = IngestExternalFileOptions::default();
+            ingest_opts.set_move_files(true);
+            let ingest_result = self.db.ingest_external_file_opts(&ingest_opts, sst_files);
+            if let Err(e) = ingest_result {
+                warn!("failed to ingest SST files {:?}", e);
+                err = Some(BarnError::TxWriteError);
+            }
+            else {
+                let put_result = self.db.put(&DB_PRIMARY_KEY_KEY, &pk.to_le_bytes());
+                if let Err(e) = put_result {
+                    warn!("failed to write the primary key value {} into DB", pk);
+                    err = Some(BarnError::TxWriteError);
+                }
+            }
+
+            // info!("removing temporary directory");
+            // let _ = fs::remove_dir_all(sst_temp_dir);
+        }
+
+        if err.is_some() {
+            return Err(err.unwrap());
+        }
+
+        info!("inserted {} records", count);
+        Ok(())
     }
 }
 
