@@ -102,7 +102,7 @@ impl Barn {
             res_db_opts.set_env(&env);
             res_db_opts.set_compression_type(DBCompressionType::Snappy);
             res_db_opts.set_use_direct_io_for_flush_and_compaction(true);
-            res_db_opts.set_writable_file_max_buffer_size(100 * 1024 * 1024); // 10MB
+            res_db_opts.set_writable_file_max_buffer_size(100 * 1024 * 1024); // 100 MB
             res_db_opts.increase_parallelism(num_cores);
 
             //res_db_opts.set_use_direct_reads(true);
