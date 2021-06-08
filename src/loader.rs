@@ -11,6 +11,7 @@ use crate::barn;
 use crate::errors::BarnError;
 use bson::{Document, Bson};
 use serde::Serialize;
+use std::ops::Sub;
 
 #[derive(Debug, Error)]
 pub enum LoadError {
@@ -71,8 +72,16 @@ pub fn load_data<R>(source: R, res_name: &str, barn: &barn::Barn, ignore_errors:
     Ok(())
 }
 
+// pub fn search_data<W>(res_name: String, query: String, barn: &barn::Barn, target: &mut W) -> Result<(), LoadError>
+//     where W: Write {
+//     _search_data(res_name.clone(), query.clone(), barn, target);
+//     return _search_data(res_name.clone(), query.clone(), barn, target);
+// }
+
 pub fn search_data<W>(res_name: String, query: String, barn: &barn::Barn, target: &mut W) -> Result<(), LoadError>
 where W: Write {
+    //let start = std::time::SystemTime::now();
+
     let (sn, rc) = channel();
     let search_result = barn.search(res_name, query, sn);
     if let Err(e) = search_result {
@@ -95,5 +104,8 @@ where W: Write {
             target.write(new_line);
         }
     }
+
+    //let end  = std::time::SystemTime::now();
+    //println!("time taken for full scan {}", end.duration_since(start).unwrap().as_millis());
     Ok(())
 }

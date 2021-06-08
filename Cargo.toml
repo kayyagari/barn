@@ -29,6 +29,7 @@ rawbson = "0.2.1"
 # https://github.com/facebook/rocksdb/wiki/Compression
 rocksdb = {version = "0.16.0", features = ["lz4"]}
 bson = "1.2.2"
+num_cpus = "1.13.0"
 
 [dev-dependencies]
 assert-cmp = "0.2.0"

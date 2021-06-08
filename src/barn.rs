@@ -13,7 +13,7 @@ use log::{debug, error, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::private::PathAsDisplay;
-use rocksdb::{Env, DB, Options, IteratorMode};
+use rocksdb::{Env, DB, Options, IteratorMode, DBCompressionType};
 
 use crate::conf::*;
 use crate::errors::BarnError::{DbConfigError, EnvOpenError, TxCommitError};
@@ -77,6 +77,8 @@ impl Barn {
             return Err(DbConfigError);
         }
 
+        let num_cores = num_cpus::get() as i32;
+
         for rname in &res_names {
             let res_conf = db_conf.resources.get(rname);
 
@@ -98,6 +100,14 @@ impl Barn {
             res_db_opts.create_if_missing(true);
             res_db_opts.create_missing_column_families(true);
             res_db_opts.set_env(&env);
+            res_db_opts.set_compression_type(DBCompressionType::Snappy);
+            res_db_opts.set_use_direct_io_for_flush_and_compaction(true);
+            res_db_opts.set_writable_file_max_buffer_size(100 * 1024 * 1024); // 10MB
+            res_db_opts.increase_parallelism(num_cores);
+
+            //res_db_opts.set_use_direct_reads(true);
+            //res_db_opts.set_compaction_readahead_size(5 * 1024 * 1024);
+
             let mut res_db_path = PathBuf::from(&db_path);
             res_db_path.push(rname.to_lowercase());
             let mut res_db = DB::open(&res_db_opts, &res_db_path).unwrap();
