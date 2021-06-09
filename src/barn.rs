@@ -49,7 +49,35 @@ struct Index {
 }
 
 impl Barn {
+    pub fn open_for_bulk_load<R>(db_path: PathBuf, db_conf: &DbConf, schema_rdr: R) -> Result<Barn, BarnError>
+        where R: Read {
+        let mut opts = Self::default_db_options();
+        opts.prepare_for_bulk_load();
+        Self::_open(db_path, db_conf, schema_rdr, &mut opts)
+    }
+
     pub fn open<R>(db_path: PathBuf, db_conf: &DbConf, schema_rdr: R) -> Result<Barn, BarnError>
+        where R: Read {
+        let mut opts = Self::default_db_options();
+        Self::_open(db_path, db_conf, schema_rdr, &mut opts)
+    }
+
+    fn default_db_options() -> Options {
+        let mut res_db_opts = Options::default();
+        res_db_opts.create_if_missing(true);
+        res_db_opts.create_missing_column_families(true);
+        res_db_opts.set_compression_type(DBCompressionType::Snappy);
+        res_db_opts.set_use_direct_io_for_flush_and_compaction(true);
+        res_db_opts.set_writable_file_max_buffer_size(100 * 1024 * 1024); // 100 MB
+        //res_db_opts.increase_parallelism(cpu_count);
+
+        //res_db_opts.set_use_direct_reads(true);
+        //res_db_opts.set_compaction_readahead_size(5 * 1024 * 1024);
+
+        res_db_opts
+    }
+
+    fn _open<R>(db_path: PathBuf, db_conf: &DbConf, schema_rdr: R, res_db_opts: &mut Options) -> Result<Barn, BarnError>
     where R: Read {
         let is_mdb_ext = db_path.to_str().unwrap().ends_with(".mdb");
         if !db_path.exists() || !is_mdb_ext {
@@ -99,21 +127,10 @@ impl Barn {
 
             let mut indices: HashMap<String, Index> = HashMap::new();
 
-            let mut res_db_opts = Options::default();
-            res_db_opts.create_if_missing(true);
-            res_db_opts.create_missing_column_families(true);
-            res_db_opts.set_env(&env);
-            res_db_opts.set_compression_type(DBCompressionType::Snappy);
-            res_db_opts.set_use_direct_io_for_flush_and_compaction(true);
-            res_db_opts.set_writable_file_max_buffer_size(100 * 1024 * 1024); // 100 MB
-            res_db_opts.increase_parallelism(cpu_count);
-
-            //res_db_opts.set_use_direct_reads(true);
-            //res_db_opts.set_compaction_readahead_size(5 * 1024 * 1024);
-
             let mut res_db_path = PathBuf::from(&db_path);
             res_db_path.push(rname.to_lowercase());
-            let mut res_db = DB::open(&res_db_opts, &res_db_path).unwrap();
+            res_db_opts.set_env(&env);
+            let mut res_db = DB::open(res_db_opts, &res_db_path).unwrap();
 
             let mut id_attr_name = String::from("");
             let mut id_attr_type = String::from("");
@@ -189,7 +206,7 @@ impl Barn {
             // create resource level DB
             let barrel = Barrel{
                 db: res_db,
-                opts: res_db_opts,
+                opts: res_db_opts.clone(),
                 indices,
                 id_attr_name,
                 id_attr_type
@@ -216,6 +233,18 @@ impl Barn {
             warn!("aborting transaction due to {}", e);
             return Err(e);
         }
+
+        Ok(())
+    }
+
+    pub fn compact(&self, res_name: &str) -> Result<(), BarnError> {
+        let barrel = self.barrels.get(res_name);
+        if let None = barrel {
+            return Err(BarnError::UnknownResourceName);
+        }
+
+        info!("running compaction on {}", res_name);
+        barrel.unwrap().db.compact_range(None::<&[u8]>, None::<&[u8]>);
 
         Ok(())
     }
@@ -304,7 +333,8 @@ impl Barn {
             return Err(BarnError::UnknownResourceName);
         }
 
-        barrel.unwrap().bulk_load(source, ignore_errors)
+        let barrel = barrel.unwrap();
+        barrel.bulk_load(source, ignore_errors)
     }
 
     pub fn close(&mut self) {
@@ -487,9 +517,18 @@ impl Barrel {
             return Err(BarnError::IOError(e));
         }
 
+        let mut sst_opts = self.opts.clone();
+        sst_opts.prepare_for_bulk_load();
+        //sst_opts.set_disable_auto_compactions(true);
+        let cmp = |k1: &[u8], k2: &[u8]| -> Ordering {
+            println!("comparing {:?} with {:?}", k1, k2);
+          Ordering::Less
+        };
+        sst_opts.set_comparator("key-comparator", cmp);
+
         let mut err: Option<BarnError> = None;
 
-        let mut sst_file: rocksdb::SstFileWriter = rocksdb::SstFileWriter::create(&self.opts);
+        let mut sst_file: rocksdb::SstFileWriter = rocksdb::SstFileWriter::create(&sst_opts);
         loop {
             let byte_count = reader.read_until(b'\n', &mut buf);
             if let Err(e) = byte_count {
@@ -534,6 +573,7 @@ impl Barrel {
                     let doc_buf = DocBuf::from_document(&doc);
 
                     pk += 1;
+                    //let t = time::Instant::now().elapsed().whole_milliseconds() as u64;
                     let put_result = sst_file.put(&pk.to_le_bytes(), doc_buf.as_bytes());
                     if let Err(e) = put_result {
                         warn!("failed to store record {:?}", e);

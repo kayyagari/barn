@@ -32,19 +32,18 @@ fn main() {
             println!("{:?} preparing to load data", l);
             println!("{:?}", cmd_line.db_path);
             let db_conf = conf::DbConf::new(10240, true, l.resource_name.clone());
-            let mut barn = barn::Barn::open(cmd_line.db_path, &db_conf, conf::EXAMPLE_SCHEMA.as_bytes()).unwrap();
+            let mut barn = barn::Barn::open_for_bulk_load(cmd_line.db_path, &db_conf, conf::EXAMPLE_SCHEMA.as_bytes()).unwrap();
             let mut stream: Box<dyn std::io::Read>;
             if None == l.json_file {
                 stream = Box::new(std::io::stdin());
             }
             else {
-                stream = Box::new(File::open(l.json_file.unwrap()).unwrap());
+                let result = loader::load_data_from_file(l.json_file.unwrap(), l.resource_name.as_str(), &barn, true);
+                if let Err(e) = result {
+                    error!("{:?}", e);
+                }
             }
 
-            let result = loader::load_data(stream, l.resource_name.as_str(), &barn, true);
-            if let Err(e) = result {
-                error!("{:?}", e);
-            }
             barn.close();
         },
         conf::SubCommand::Search(s) => {
