@@ -1,24 +1,73 @@
 use std::fs;
-
-use actix_web::{web, App, HttpServer};
+use std::fs::File;
+use std::path::PathBuf;
 use std::sync::Arc;
-use barn::AppData;
-use log4rs::append::console::ConsoleAppender;
-use log4rs::config::{Appender, Root, Config};
-use log::{info, LevelFilter};
-use clap::{Arg};
+
+use actix_web::{App, HttpServer, web};
+use clap::Arg;
 use jsonschema_valid::schemas::Draft::*;
-use serde_json::Value;
+use log::{info, error, LevelFilter};
+use log4rs::append::console::ConsoleAppender;
+use log4rs::config::{Appender, Config, Root};
+use serde::Serialize;
+use serde_json::{json, Value};
+use structopt::StructOpt;
 
 mod schema;
 mod errors;
+mod conf;
+mod loader;
+mod barn;
+mod http;
 
 //#[cfg(target_os = "linux")]
 // #[global_allocator]
 // static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+fn main() {
+    configure_log4rs();
+    let cmd_line: conf::CmdLine = conf::CmdLine::from_args();
+    match cmd_line.sub {
+        conf::SubCommand::Load(l) => {
+            println!("{:?} preparing to load data", l);
+            println!("{:?}", cmd_line.db_path);
+            let db_conf = conf::DbConf::new(10240, true, l.resource_name.clone());
+            let mut barn = barn::Barn::open_for_bulk_load(cmd_line.db_path, &db_conf, conf::EXAMPLE_SCHEMA.as_bytes()).unwrap();
+            let mut stream: Box<dyn std::io::Read>;
+            if None == l.json_file {
+                stream = Box::new(std::io::stdin());
+            }
+            else {
+                let result = loader::load_data_from_file(l.json_file.unwrap(), l.resource_name.as_str(), &barn, true);
+                if let Err(e) = result {
+                    error!("{:?}", e);
+                }
+            }
+
+            barn.close();
+        },
+        conf::SubCommand::Search(s) => {
+            let db_conf = conf::DbConf::new(10240, true, s.resource_name.clone());
+            let mut barn = barn::Barn::open(cmd_line.db_path, &db_conf, conf::EXAMPLE_SCHEMA.as_bytes()).unwrap();
+            let mut stream: Box<dyn std::io::Write>;
+            if None == s.out_file {
+                stream = Box::new(std::io::stdout());
+            }
+            else {
+                stream = Box::new(File::create(s.out_file.unwrap()).unwrap());
+            }
+            let result = loader::search_data(s.resource_name, s.query, &barn, &mut stream);
+            if let Err(e) = result {
+                error!("failed to search the data {:?}", e);
+            }
+            barn.close();
+
+        }
+    }
+}
+/*
 #[actix_web::main]
-async fn main() -> std::io::Result<()> {
+async fn main1() -> std::io::Result<()> {
     configure_log4rs();
     let matches = clap::App::new("barn")
         .arg(Arg::with_name("d")
@@ -55,11 +104,11 @@ async fn main() -> std::io::Result<()> {
     let db_conf = serde_json::from_reader(db_conf_file).unwrap();
 
     let schema_file = fs::File::open(schema_file).unwrap();
-    let barn = barn::Barn::open(env_dir, &db_conf, schema_file).unwrap();
+    let barn = barn::Barn::open(PathBuf::from(env_dir), &db_conf, schema_file).unwrap();
     let s_ref: &'static serde_json::Value = Box::leak(barn.schema.clone());
     let draft = draft_from_schema(s_ref);
     let validator = jsonschema_valid::Config::from_schema(s_ref, draft).unwrap();
-    let ad: AppData = barn::AppData {
+    let ad: http::AppData = http::AppData {
         barn: Arc::new(barn),
         validator: Arc::new(validator)
     };
@@ -69,16 +118,16 @@ async fn main() -> std::io::Result<()> {
             .data(ad.clone())
             .app_data(web::JsonConfig::default())
             .app_data(web::QueryConfig::default())
-            .service(barn::echo)
-            .service(barn::insert)
-            .service(barn::get)
-            .service(barn::search)
+            .service(http::echo)
+            .service(http::insert)
+            .service(http::get)
+            .service(http::search)
     })
     .bind("0.0.0.0:9070")?
     .run()
     .await
 }
-
+*/
 fn configure_log4rs() {
     let stdout = ConsoleAppender::builder().build();
 

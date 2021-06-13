@@ -1,93 +1,116 @@
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fs;
-use std::io::Read;
-use std::path::Path;
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
 use actix_web::web::Bytes;
+use bson::{Bson, Document};
 use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use jsonpath_lib::Selector;
-use lmdb::{Cursor, Database, DatabaseFlags, Environment, EnvironmentFlags, RoTransaction, RwTransaction, Transaction, WriteFlags};
-use log::{debug, info, trace, warn};
-use rmps::Serializer;
+use log::{debug, error, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use thiserror::private::PathAsDisplay;
+use rocksdb::{Env, DB, Options, IteratorMode, DBCompressionType, IngestExternalFileOptions};
 
+use crate::conf::*;
 use crate::errors::BarnError::{DbConfigError, EnvOpenError, TxCommitError};
 use crate::errors::BarnError;
 use crate::schema;
-use crate::conf::*;
+use rawbson::DocBuf;
+use std::cmp::Ordering;
 
 const DB_PRIMARY_KEY_KEY : [u8; 8] = 0_i64.to_le_bytes();
 const DB_READ_START_KEY : [u8; 8] = 1_i64.to_le_bytes();
-const PK_WRITE_FLAGS: WriteFlags = WriteFlags::empty();
 
 pub struct Barn {
-    env: Environment,
+    env: Env,
     barrels: HashMap<String, Barrel>,
     pub schema: Box<Value>
 }
 
 struct Barrel {
-    db: Database,
+    db: DB,
+    opts: Options,
     id_attr_name: String,
     id_attr_type: String,
-    indices: HashMap<String, Index>,
-    flags: WriteFlags
+    indices: HashMap<String, Index>
 }
 
 struct Index {
-    db: Database,
+    name: String,
     unique: bool,
     at_path: String,
     val_type: String,
-    val_format: String,
-    flags: WriteFlags
+    val_format: String
     //key_maker: KeyMaker
 }
 
 impl Barn {
-    pub fn open<R>(env_dir: &str, db_conf: &DbConf, schema_rdr: R) -> Result<Barn, BarnError>
+    pub fn open_for_bulk_load<R>(db_path: PathBuf, db_conf: &DbConf, schema_rdr: R) -> Result<Barn, BarnError>
+        where R: Read {
+        let mut opts = Self::default_db_options();
+        opts.prepare_for_bulk_load();
+        Self::_open(db_path, db_conf, schema_rdr, &mut opts)
+    }
+
+    pub fn open<R>(db_path: PathBuf, db_conf: &DbConf, schema_rdr: R) -> Result<Barn, BarnError>
+        where R: Read {
+        let mut opts = Self::default_db_options();
+        Self::_open(db_path, db_conf, schema_rdr, &mut opts)
+    }
+
+    fn default_db_options() -> Options {
+        let mut res_db_opts = Options::default();
+        res_db_opts.create_if_missing(true);
+        res_db_opts.create_missing_column_families(true);
+        res_db_opts.set_compression_type(DBCompressionType::Snappy);
+        res_db_opts.set_use_direct_io_for_flush_and_compaction(true);
+        res_db_opts.set_writable_file_max_buffer_size(100 * 1024 * 1024); // 100 MB
+        //res_db_opts.increase_parallelism(cpu_count);
+
+        //res_db_opts.set_use_direct_reads(true);
+        //res_db_opts.set_compaction_readahead_size(5 * 1024 * 1024);
+
+        res_db_opts
+    }
+
+    fn _open<R>(db_path: PathBuf, db_conf: &DbConf, schema_rdr: R, res_db_opts: &mut Options) -> Result<Barn, BarnError>
     where R: Read {
-        let r = fs::create_dir_all(env_dir.clone());
-        match r {
-            Err(e) => {
-                warn!("unable to create the db environment directory {}", &env_dir);
-                return Err(EnvOpenError);
-            },
-            Ok(_) => {
-                info!("opened db environment {}", &env_dir);
+        let is_mdb_ext = db_path.to_str().unwrap().ends_with(".mdb");
+        if !db_path.exists() || !is_mdb_ext {
+            let r = fs::create_dir_all(db_path.clone());
+            match r {
+                Err(e) => {
+                    warn!("unable to create the db environment directory {}", db_path.as_display());
+                    return Err(EnvOpenError);
+                },
+                Ok(_) => {
+                }
             }
         }
 
         let schema: Value = serde_json::from_reader(schema_rdr).unwrap();
-        let db_size_in_bytes: usize = db_conf.db_size * 1024 * 1024;
-        let mut env_flags = EnvironmentFlags::NO_READAHEAD;
-        if db_conf.no_sync {
-            env_flags |= EnvironmentFlags::NO_SYNC;
-        }
-        let env = Environment::new().set_flags(env_flags).set_max_dbs(20000).set_map_size(db_size_in_bytes).open(Path::new(&env_dir)).unwrap();
+        let env = Env::default().unwrap();
+        info!("opened db environment");
         let mut barrels: HashMap<String, Barrel> = HashMap::new();
 
-        let mut res_names = schema::get_res_names(&schema);
-        if res_names == None {
-            info!("no resource definitions found in the schema's oneOf section, using the resource defined in configuration");
-            let mut tmp = vec!();
-            for k in db_conf.resources.keys() {
-                tmp.push(k.clone());
-            }
-            if tmp.len() != 0 {
-                res_names = Some(tmp);
-            }
-            else {
-                warn!("no resources found either in schema or in configuration");
-                return Err(DbConfigError);
-            }
+        let mut res_names = vec!();
+        for k in db_conf.resources.keys() {
+            res_names.push(k.clone());
         }
 
-        let tx = env.begin_rw_txn().unwrap();
-        for rname in &res_names.unwrap() {
+        if res_names.len() == 0 {
+            warn!("no resources found either in schema or in configuration");
+            return Err(DbConfigError);
+        }
+
+        let cpu_count = num_cpus::get() as i32;
+        debug!("number of CPUs {}", cpu_count);
+
+        for rname in &res_names {
             let res_conf = db_conf.resources.get(rname);
 
             if db_conf.allow_conf_resources_only && res_conf.is_none() {
@@ -103,26 +126,32 @@ impl Barn {
             }
 
             let mut indices: HashMap<String, Index> = HashMap::new();
-            match res_def {
-                Some(v) => {
-                    let mut id_attr_name = String::from("");
-                    let mut id_attr_type = String::from("");
-                    if res_conf.is_some() {
-                        let res_conf = res_conf.unwrap();
-                        if res_conf.id_attr_name.is_some() {
-                            id_attr_name = res_conf.id_attr_name.as_ref().unwrap().clone();
-                        }
 
-                        if res_conf.id_attr_type.is_some() {
-                            id_attr_type = res_conf.id_attr_type.as_ref().unwrap().clone();
-                        }
+            let mut res_db_path = PathBuf::from(&db_path);
+            res_db_path.push(rname.to_lowercase());
+            res_db_opts.set_env(&env);
+            let mut res_db = DB::open(res_db_opts, &res_db_path).unwrap();
 
-                        for i in &res_conf.indices {
-                            let at_path = i.attr_path.replace(".", "/");
+            let mut id_attr_name = String::from("");
+            let mut id_attr_type = String::from("");
+            if res_conf.is_some() {
+                let res_conf = res_conf.unwrap();
+                if res_conf.id_attr_name.is_some() {
+                    id_attr_name = res_conf.id_attr_name.as_ref().unwrap().clone();
+                }
+
+                if res_conf.id_attr_type.is_some() {
+                    id_attr_type = res_conf.id_attr_type.as_ref().unwrap().clone();
+                }
+
+                for i in &res_conf.indices {
+                    let mut at_type_val : &str = "string";
+                    let mut at_type_format : &str = "";
+                    let mut at_path = i.attr_path.replace(".", "/");
+                    match res_def {
+                        Some(v) => {
                             let at_pointer = format!("/properties/{}", &at_path);
                             let at_def = v.pointer(at_pointer.as_str()).unwrap().as_object().unwrap();
-                            let at_type_val : &str;
-                            let mut at_type_format : &str = "";
                             let at_type = at_def.get(&String::from("type"));
                             if let Some(t) = at_type {
                                 at_type_val = at_type.unwrap().as_str().unwrap();
@@ -140,209 +169,192 @@ impl Barn {
                                     at_type_format = at_format.unwrap().as_str().unwrap();
                                 }
                             }
-                            let mut unique = false;
-                            if let Some(u) = i.unique {
-                                unique = u;
-                            }
-
-                            unsafe {
-                                let index_name = format!("{}_{}", rname, &i.attr_path);
-                                let mut write_flags = WriteFlags::empty();
-                                let mut db_flags = DatabaseFlags::empty();
-                                if !unique {
-                                    db_flags = db_flags | DatabaseFlags::INTEGER_DUP | DatabaseFlags::DUP_SORT | DatabaseFlags::DUP_FIXED;
-                                    write_flags = write_flags | WriteFlags::NO_DUP_DATA;
-                                }
-                                else {
-                                    write_flags = write_flags | WriteFlags::NO_OVERWRITE;
-                                }
-
-                                let db = tx.create_db(Some(index_name.as_str()), db_flags).unwrap();
-                                // prefix with a slash to make it a valid pointer for the object
-                                let at_path = format!("/{}", &at_path);
-                                let idx = Index{
-                                    db,
-                                    unique,
-                                    at_path,
-                                    val_type: String::from(at_type_val),
-                                    val_format: String::from(at_type_format),
-                                    flags: write_flags
-                                };
-
-                                indices.insert(index_name, idx);
-                            }
-                        } // end of creation of indices for one resource
-                    }
-
-                    if id_attr_name.len() == 0 {
-                        id_attr_name = db_conf.resource_defaults.id_attr_name.clone();
-                    }
-
-                    if id_attr_type.len() == 0 {
-                        id_attr_type = db_conf.resource_defaults.id_attr_type.clone();
-                    }
-
-                    // create resource level DB
-                    unsafe {
-                        let db = tx.create_db(Some(rname.as_str()), DatabaseFlags::INTEGER_KEY).unwrap();
-                        let barrel = Barrel{
-                            db,
-                            indices,
-                            id_attr_name,
-                            id_attr_type,
-                            flags: WriteFlags::NO_OVERWRITE
-                        };
-                        barrels.insert(rname.clone(), barrel);
-                    }
-                },
-                _ => {
-                    warn!("no resource definition found for {}", rname);
-                    return Err(DbConfigError);
-                }
-            }
-        }
-
-        match tx.commit() {
-            Ok(_) => {
-                Ok(Barn {
-                    env,
-                    barrels,
-                    schema: Box::new(schema)
-                })
-            },
-            Err(e) => {
-                Err(TxCommitError)
-            }
-        }
-    }
-
-    pub fn insert(&self, res_name: String, r: &mut Value) -> Result<(), BarnError> {
-        let barrel = self.barrels.get(res_name.as_str());
-        if let None = barrel {
-            return Err(BarnError::UnknownResourceName);
-        }
-
-        let tx_result = self.env.begin_rw_txn();
-
-        match tx_result {
-            Ok(mut tx) => {
-                let barrel_result = barrel.unwrap().insert(&mut tx, r);
-                match barrel_result {
-                    Ok(_) => {
-                        match tx.commit() {
-                            Ok(_) => {
-                                Ok(())
-                            },
-                            Err(e) => {
-                                warn!("failed to insert resource {}", e);
-                                Err(BarnError::TxCommitError)
-                            }
+                        },
+                        _ => {
+                            info!("no resource definition found for {} in schema, using type information from DB configuration", rname);
                         }
-                    },
-                    Err(e) => {
-                        warn!("aborting transaction due to {}", e);
-                        tx.abort();
-                        Err(e)
                     }
-                }
-            },
-            Err(e) => {
-                Err(BarnError::TxBeginError)
+                    let mut unique = false;
+                    if let Some(u) = i.unique {
+                        unique = u;
+                    }
+
+                    let index_name = format!("{}_{}", rname.to_lowercase(), &i.attr_path);
+                    res_db.create_cf(index_name.as_str(), &res_db_opts);
+                    // prefix with a slash to make it a valid pointer for the object
+                    at_path = format!("/{}", at_path);
+                    let idx = Index{
+                        name: index_name.clone(),
+                        unique,
+                        at_path,
+                        val_type: String::from(at_type_val),
+                        val_format: String::from(at_type_format)
+                    };
+
+                    indices.insert(index_name, idx);
+                } // end of creation of indices for one resource
             }
+
+            if id_attr_name.len() == 0 {
+                id_attr_name = db_conf.resource_defaults.id_attr_name.clone();
+            }
+
+            if id_attr_type.len() == 0 {
+                id_attr_type = db_conf.resource_defaults.id_attr_type.clone();
+            }
+
+            // create resource level DB
+            let barrel = Barrel{
+                db: res_db,
+                opts: res_db_opts.clone(),
+                indices,
+                id_attr_name,
+                id_attr_type
+            };
+            barrels.insert(rname.clone(), barrel);
+            info!("opened resource db {}", res_db_path.as_display());
         }
+
+        Ok(Barn {
+            env,
+            barrels,
+            schema: Box::new(schema)
+        })
     }
 
-    pub fn get(&self, id: u64, res_name: String) -> Result<Value, BarnError> {
+    pub fn insert(&self, res_name: &str, r: &mut Document) -> Result<(), BarnError> {
+        let barrel = self.barrels.get(res_name);
+        if let None = barrel {
+            return Err(BarnError::UnknownResourceName);
+        }
+
+        let barrel_result = barrel.unwrap().insert(r);
+        if let Err(e) = barrel_result {
+            warn!("aborting transaction due to {}", e);
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    pub fn compact(&self, res_name: &str) -> Result<(), BarnError> {
+        let barrel = self.barrels.get(res_name);
+        if let None = barrel {
+            return Err(BarnError::UnknownResourceName);
+        }
+
+        info!("running compaction on {}", res_name);
+        barrel.unwrap().db.compact_range(None::<&[u8]>, None::<&[u8]>);
+
+        Ok(())
+    }
+
+    pub fn get(&self, id: u64, res_name: String) -> Result<Document, BarnError> {
         let barrel = self.barrels.get(res_name.as_str());
         if let None = barrel {
             return Err(BarnError::UnknownResourceName);
         }
 
-        let tx_result = self.env.begin_ro_txn();
-        match tx_result {
-            Ok(tx) => {
-                let val_result = barrel.unwrap().get(id, &tx);
-                let _ = tx.commit();
-                val_result
-            },
-            Err(e) => {
-                Err(BarnError::TxBeginError)
-            }
-        }
+        barrel.unwrap().get(id)
     }
 
-    pub fn search(&self, res_name: String, expr: String, sn: Sender<Result<Bytes, std::io::Error>>) -> Result<(), BarnError> {
+    pub fn search(&self, res_name: String, expr: String, sn: Sender<Result<Vec<u8>, std::io::Error>>) -> Result<(), BarnError> {
         let barrel = self.barrels.get(res_name.as_str());
         if let None = barrel {
             return Err(BarnError::UnknownResourceName);
-        }
-
-        let tx_result = self.env.begin_ro_txn();
-        if let Err(e) = tx_result {
-            return Err(BarnError::TxBeginError);
         }
 
         let mut compiled_path = jsonpath_lib::compile(expr.as_str());
 
         let barrel = barrel.unwrap();
-        let tx = tx_result.unwrap();
-        let cursor = tx.open_ro_cursor(barrel.db);
-        if let Err(e) = cursor {
-            return Err(BarnError::TxReadError);
-        }
+        let mut cursor = barrel.db.iterator(IteratorMode::Start);
 
-        let send_result = sn.send(Ok(Bytes::from_static(b"[")));
-
-        let mut send_comma = false;
         // the first row will always be key 0 which stores the PK value, and will be skipped
-        for row in cursor.unwrap().iter_from(DB_READ_START_KEY) {
-            if let Err(e) = row {
+        cursor.next();
+
+        let mut count = 0;
+        loop {
+            let row = cursor.next();
+            if None == row {
                 break;
             }
 
-            let (key, data) = row.unwrap();
-            let json_val: Value = rmps::from_read_ref(data).unwrap();
-            let result = compiled_path(&json_val);
-            if result.is_ok() {
-                if result.unwrap().len() == 0 {
-                    continue;
-                }
-                let str_result = serde_json::to_vec(&json_val);
-                match str_result {
-                    Ok(vec) => {
-                        if send_comma {
-                            let send_result = sn.send(Ok(Bytes::from_static(b",")));
+            let (key, mut data) = row.unwrap();
+            unsafe {
+                let result = DocBuf::new_unchecked(Vec::from(data));
+                count += 1;
+                let beic = result.get("Business_Entities_in_Colorado");
+                match beic {
+                    Ok(elm) => {
+                        if elm.is_some() {
+                            let elm = elm.unwrap();
+                            let entity_id = elm.as_document().unwrap().get("entityid");
+                            if entity_id.is_ok() {
+                                let entityid = entity_id.unwrap().unwrap().as_str().unwrap();
+                                if entityid == "20201233700" {
+                                    let send_result = sn.send(Ok(result.as_bytes().to_owned()));
+                                    if let Err(e) = send_result {
+                                        warn!("error received while sending search results {:?}", e);
+                                        break;
+                                    }
+                                }
+                            }
                         }
-                        let send_result = sn.send(Ok(Bytes::from(vec)));
-                        if let Err(e) = send_result {
-                            warn!("error received while sending search results {:?}", e);
-                            break;
-                        }
-                        send_comma = true;
-                    }
+                    },
                     Err(e) => {
-                        warn!("failed to convert the result to string, stopping further processing {:?}", e);
+                        warn!("failed to parse BSON document, stopping further processing {:?}", e);
                         break;
                     }
                 }
             }
+            //let result = Document::from_reader(&mut data.as_ref());
+            //let result = compiled_path(&json_val);
+            // match result {
+            //     Ok(vec) => {
+            //         //let mut data = Vec::new();
+            //     }
+            //     Err(e) => {
+            //         warn!("failed to parse BSON document, stopping further processing {:?}", e);
+            //         break;
+            //     }
+            // }
         }
 
-        let send_result = sn.send(Ok(Bytes::from_static(b"]")));
         drop(sn);
-        let _ = tx.commit();
 
+        println!("read {} entries", count);
         Ok(())
+    }
+
+    pub fn bulk_load<R>(&self, source: R, res_name: &str, ignore_errors: bool) -> Result<(), BarnError>
+        where R: Read {
+        let barrel = self.barrels.get(res_name);
+        if let None = barrel {
+            return Err(BarnError::UnknownResourceName);
+        }
+
+        let barrel = barrel.unwrap();
+        barrel.bulk_load(source, ignore_errors)
+    }
+
+    pub fn close(&mut self) {
+        info!("closing the environment");
+        for (res, b) in &self.barrels {
+            for (idx_name, idx) in &b.indices {
+            }
+            b.db.flush();
+        }
     }
 }
 
 impl Index {
-    fn insert(&self, tx: &mut RwTransaction, k: &Value, v: u64) -> Result<(), BarnError> {
-        let mut put_result = Err(lmdb::Error::from_err_code(-1));
+    fn insert(&self, db: &mut DB, k: &Value, v: u64) -> Result<(), BarnError> {
+        let cf_handle = db.cf_handle(self.name.as_str()).unwrap();
+        let mut put_result = Ok(());
         match self.val_type.as_str() {
             "integer" => {
                 if let Some(i) = k.as_i64() {
-                    put_result = tx.put(self.db, &i.to_le_bytes(), &v.to_le_bytes(), self.flags);
+                    put_result = db.put_cf(cf_handle, &i.to_le_bytes(), &v.to_le_bytes());
                 }
             },
             "string" => {
@@ -367,12 +379,12 @@ impl Index {
                         }
                     }
 
-                    put_result = tx.put(self.db, AsRef::<Vec<u8>>::as_ref(&key_data), &v.to_le_bytes(), self.flags);
+                    put_result = db.put_cf(cf_handle, AsRef::<Vec<u8>>::as_ref(&key_data), &v.to_le_bytes());
                 }
             },
             "number" => {
                 if let Some(f) = k.as_f64() {
-                    put_result = tx.put(self.db, &f.to_le_bytes(), &v.to_le_bytes(), self.flags);
+                    put_result = db.put_cf(cf_handle, &f.to_le_bytes(), &v.to_le_bytes());
                 }
             },
             _ => {
@@ -388,84 +400,57 @@ impl Index {
 }
 
 impl Barrel {
-    fn insert(&self, tx: &mut RwTransaction, data : &mut Value) -> Result<(), BarnError> {
-        let d_obj = data.as_object_mut();
-        if let None = d_obj {
-            return Err(BarnError::InvalidResourceDataError);
-        }
-
-        let d_obj = d_obj.unwrap();
-        let pk_result = tx.get(self.db, &DB_PRIMARY_KEY_KEY);
+    fn insert(&self, data : &mut Document) -> Result<(), BarnError> {
+        let pk_result = self.db.get(&DB_PRIMARY_KEY_KEY);
         let mut pk: u64 = 1;
         if let Ok(r) = pk_result {
-            pk = u64::from_le_bytes(r.try_into().unwrap());
-            pk += 1;
-        }
-
-        let pk_val;
-        match self.id_attr_type.as_str() {
-            "string" => {
-                pk_val = Value::from(format!("{}", pk));
-            },
-            _ => {
-                pk_val = Value::from(pk);
+            if r.is_some() {
+                pk = from_le_bytes(&r.unwrap());
+                pk += 1;
             }
         }
-        let pk_existing_attr = d_obj.remove(&self.id_attr_name);
-        if let Some(id_val) = pk_existing_attr {
-            trace!("dropping the value {} given for ID attribute {}", &id_val, &self.id_attr_name);
+
+        self.add_id_to_doc(data, pk);
+
+        // for (at_name, i) in &self.indices {
+        //     let at = data.pointer(&i.at_path);
+        //     if let Some(at_val) = at {
+        //         i.insert(tx, at_val, pk)?;
+        //     }
+        // }
+
+        // then update the resource's DB
+        let doc_buf = DocBuf::from_document(&data);
+
+        let put_result = self.db.put(&pk.to_le_bytes(), doc_buf.as_bytes());
+        if let Err(_) = put_result {
+            return Err(BarnError::TxWriteError);
         }
 
-        d_obj.insert(self.id_attr_name.clone(), pk_val);
-
-        let mut buf: Vec<u8> = Vec::new();
-        let ser_result = data.serialize(&mut Serializer::new(&mut buf));
-        match ser_result {
-            Ok(_) => {
-                // first update indices, this will catch any unique constraint violations
-                for (at_name, i) in &self.indices {
-                    let at = data.pointer(&i.at_path);
-                    if let Some(at_val) = at {
-                        i.insert(tx, at_val, pk)?;
-                    }
-                }
-
-                // then update the resource's DB
-                let put_result = tx.put(self.db, &pk.to_le_bytes(), AsRef::<Vec<u8>>::as_ref(&buf), self.flags);
-                if let Err(_) = put_result {
-                    return Err(BarnError::TxWriteError);
-                }
-
-                // store the updated PK value
-                let put_result = tx.put(self.db, &DB_PRIMARY_KEY_KEY, &pk.to_le_bytes(), PK_WRITE_FLAGS);
-                if let Err(e) = put_result {
-                    return Err(BarnError::TxWriteError);
-                }
-            },
-            Err(e) => {
-                warn!("{:#?}", e);
-                return Err(BarnError::SerializationError);
-            }
+        // store the updated PK value
+        let put_result = self.db.put(&DB_PRIMARY_KEY_KEY, &pk.to_le_bytes());
+        if let Err(e) = put_result {
+            return Err(BarnError::TxWriteError);
         }
 
         Ok(())
     }
 
-    fn get(&self, id: u64, tx: &RoTransaction) -> Result<Value, BarnError> {
+    fn get(&self, id: u64) -> Result<Document, BarnError> {
         if id <= 0 {
             debug!("invalid resource identifier {}", id);
             return Err(BarnError::ResourceNotFoundError);
         }
 
-        let get_result = tx.get(self.db, &id.to_le_bytes());
+        let get_result = self.db.get(&id.to_le_bytes());
         match get_result {
             Err(e) => {
                 debug!("resource not found with identifier {}", id);
                 Err(BarnError::ResourceNotFoundError)
             },
-            Ok(data) => {
-                let val_result = rmps::from_read(data);
-                match val_result {
+            Ok(mut data) => {
+                let result = Document::from_reader(&mut data.unwrap().as_slice());
+                match result {
                     Ok(val) => {
                         /*let d_obj = val.as_object_mut().unwrap();
                         let id_val;
@@ -488,19 +473,176 @@ impl Barrel {
             }
         }
     }
+
+    fn add_id_to_doc(&self, data: &mut Document, pk: u64) {
+        let pk_val;
+        match self.id_attr_type.as_str() {
+            "string" => {
+                pk_val = Bson::from(format!("{}", pk));
+            },
+            _ => {
+                pk_val = Bson::from(pk);
+            }
+        }
+        let pk_existing_attr = data.remove(&self.id_attr_name);
+        if let Some(id_val) = pk_existing_attr {
+            trace!("dropping the value {} given for ID attribute {}", &id_val, &self.id_attr_name);
+        }
+
+        data.insert(self.id_attr_name.clone(), pk_val);
+    }
+
+    fn bulk_load<R>(&self, source: R, ignore_errors: bool) -> Result<(), BarnError>
+    where R: Read {
+        let pk_result = self.db.get(&DB_PRIMARY_KEY_KEY);
+        let mut pk: u64 = 1;
+        if let Ok(r) = pk_result {
+            if r.is_some() {
+                pk = from_le_bytes(&r.unwrap());
+            }
+        }
+
+        let mut reader = BufReader::new(source);
+        let mut buf: Vec<u8> = Vec::new();
+        let mut count: u64 = 0;
+        let sst_batch_size: u64 = 200_000;
+        let mut sst_files: Vec<PathBuf> = Vec::new();
+        let mut sst_temp_dir = PathBuf::new();
+        sst_temp_dir.push(self.db.path());
+        sst_temp_dir.push("__bulk_temp");
+
+        let dir_result = fs::create_dir(sst_temp_dir.as_path());
+        if let Err(e) = dir_result {
+            warn!("failed to created the temporary directory {:?} to store SST files {:?}", sst_temp_dir.as_path(), e);
+            return Err(BarnError::IOError(e));
+        }
+
+        let mut sst_opts = self.opts.clone();
+        sst_opts.prepare_for_bulk_load();
+        //sst_opts.set_disable_auto_compactions(true);
+        let cmp = |k1: &[u8], k2: &[u8]| -> Ordering {
+            println!("comparing {:?} with {:?}", k1, k2);
+          Ordering::Less
+        };
+        sst_opts.set_comparator("key-comparator", cmp);
+
+        let mut err: Option<BarnError> = None;
+
+        let mut sst_file: rocksdb::SstFileWriter = rocksdb::SstFileWriter::create(&sst_opts);
+        loop {
+            let byte_count = reader.read_until(b'\n', &mut buf);
+            if let Err(e) = byte_count {
+                err = Some(BarnError::IOError(e));
+                break;
+            }
+            let byte_count = byte_count.unwrap();
+            if byte_count <= 0 {
+                break;
+            }
+
+            if count % sst_batch_size == 0 {
+                if count != 0 {
+                    sst_file.finish();
+                }
+                sst_file = rocksdb::SstFileWriter::create(&self.opts);
+                let mut p = PathBuf::from(&sst_temp_dir);
+                p.push(format!("file{}.sst", pk));
+                let open_result = sst_file.open(&p);
+                if let Err(e) = open_result {
+                    warn!("failed to create new SST file {:?} {:?}", &p, e);
+                    break;
+                }
+                sst_files.push(PathBuf::from(String::from(p.to_str().unwrap())));
+            }
+
+            let val: serde_json::Result<Value> = serde_json::from_reader(buf.as_slice());
+
+            match val {
+                Err(e) => {
+                    warn!("failed to parse record {:?}", e);
+                    if !ignore_errors {
+                        err = Some(BarnError::InvalidResourceError);
+                        break;
+                    }
+                }
+
+                Ok(v) => {
+                    let bson_val = v.serialize(bson::Serializer::new()).unwrap();
+                    let mut doc = bson_val.as_document().unwrap().to_owned();
+                    self.add_id_to_doc(&mut doc, pk);
+                    let doc_buf = DocBuf::from_document(&doc);
+
+                    pk += 1;
+                    //let t = time::Instant::now().elapsed().whole_milliseconds() as u64;
+                    let put_result = sst_file.put(&pk.to_le_bytes(), doc_buf.as_bytes());
+                    if let Err(e) = put_result {
+                        warn!("failed to store record {:?}", e);
+                        err = Some(BarnError::TxWriteError);
+                        break;
+                    }
+
+                    count += 1;
+
+                    if count > sst_batch_size {
+                        break;
+                    }
+                }
+            }
+            buf.clear();
+        }
+
+        info!("merging {} files", sst_files.len());
+        if !sst_files.is_empty() {
+            sst_file.finish(); // this is the last file
+            let mut ingest_opts = IngestExternalFileOptions::default();
+            ingest_opts.set_move_files(true);
+            let ingest_result = self.db.ingest_external_file_opts(&ingest_opts, sst_files);
+            if let Err(e) = ingest_result {
+                warn!("failed to ingest SST files {:?}", e);
+                err = Some(BarnError::TxWriteError);
+            }
+            else {
+                let put_result = self.db.put(&DB_PRIMARY_KEY_KEY, &pk.to_le_bytes());
+                if let Err(e) = put_result {
+                    warn!("failed to write the primary key value {} into DB", pk);
+                    err = Some(BarnError::TxWriteError);
+                }
+            }
+
+            // info!("removing temporary directory");
+            // let _ = fs::remove_dir_all(sst_temp_dir);
+        }
+
+        if err.is_some() {
+            return Err(err.unwrap());
+        }
+
+        info!("inserted {} records", count);
+        Ok(())
+    }
 }
+
+fn from_le_bytes(b: &Vec<u8>) -> u64 {
+    let mut d : u64 = 0;
+    for i in 0..7 {
+        d |= (b[i] as u64) << i*8
+    }
+
+    d
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_open_barn() {
-        let env_dir = String::from("/tmp/barn");
+        let env_dir = PathBuf::from("/tmp/barn");
         let schema_file = fs::File::open("config/schema.json").unwrap();
         let db_conf_file = fs::File::open("config/db-conf.json").unwrap();
         let db_conf = serde_json::from_reader(db_conf_file).unwrap();
 
-        let result = Barn::open(&env_dir, &db_conf, schema_file);
+        let result = Barn::open(env_dir, &db_conf, schema_file);
         match result {
             Ok(ref b) => {
                 let dir = fs::read_dir(Path::new(&env_dir));
