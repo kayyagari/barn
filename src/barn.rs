@@ -5,10 +5,8 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
-use actix_web::web::Bytes;
 use bson::{Bson, Document};
 use chrono::{DateTime, NaiveDate, NaiveDateTime};
-use jsonpath_lib::Selector;
 use log::{debug, error, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -264,8 +262,6 @@ impl Barn {
             return Err(BarnError::UnknownResourceName);
         }
 
-        let mut compiled_path = jsonpath_lib::compile(expr.as_str());
-
         let barrel = barrel.unwrap();
         let mut cursor = barrel.db.iterator(IteratorMode::Start);
 
@@ -307,17 +303,6 @@ impl Barn {
                     }
                 }
             }
-            //let result = Document::from_reader(&mut data.as_ref());
-            //let result = compiled_path(&json_val);
-            // match result {
-            //     Ok(vec) => {
-            //         //let mut data = Vec::new();
-            //     }
-            //     Err(e) => {
-            //         warn!("failed to parse BSON document, stopping further processing {:?}", e);
-            //         break;
-            //     }
-            // }
         }
 
         drop(sn);

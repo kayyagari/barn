@@ -2,7 +2,6 @@ use std::error::Error;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
-use actix_web::web::Bytes;
 use log::{info, warn, error};
 use serde_json::Value;
 use thiserror::Error;

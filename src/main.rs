@@ -3,9 +3,8 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use actix_web::{App, HttpServer, web};
+// use actix_web::{App, HttpServer, web};
 use clap::Arg;
-use jsonschema_valid::schemas::Draft::*;
 use log::{info, error, LevelFilter};
 use log4rs::append::console::ConsoleAppender;
 use log4rs::config::{Appender, Config, Root};
@@ -18,7 +17,8 @@ mod errors;
 mod conf;
 mod loader;
 mod barn;
-mod http;
+// mod http;
+mod sql;
 
 //#[cfg(target_os = "linux")]
 // #[global_allocator]
@@ -137,22 +137,4 @@ fn configure_log4rs() {
         .unwrap();
 
     let _handle = log4rs::init_config(config).unwrap();
-}
-
-// the same method from jsonschema_valid has missing # chars at the end resulting in None for all schemas
-fn draft_from_url(url: &str) -> Option<jsonschema_valid::schemas::Draft> {
-    match url {
-        "http://json-schema.org/draft-07/schema#" => Some(Draft7),
-        "http://json-schema.org/draft-06/schema#" => Some(Draft6),
-        "http://json-schema.org/draft-04/schema#" => Some(Draft4),
-        _ => None,
-    }
-}
-
-fn draft_from_schema(schema: &Value) -> Option<jsonschema_valid::schemas::Draft> {
-    schema
-        .as_object()
-        .and_then(|x| x.get("$schema"))
-        .and_then(Value::as_str)
-        .and_then(|x| draft_from_url(x))
 }
